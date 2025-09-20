@@ -1000,30 +1000,38 @@ class TradeClickerApp:
                 if in_lockout:
                     log(f"In lockout window, skipping signal {next_signal_dt.strftime('%H:%M')} {next_side}")
                 else:
-                    # Re-locate before clicking in case layout moved
+                    # Re-locate within a small region around the pre-identified centers to avoid cross-matching.
                     try:
+                        def region_around(cx: int, cy: int, w: int = 160, h: int = 160) -> Tuple[int, int, int, int]:
+                            sw, sh = screen.screen_size()
+                            half_w = max(20, w // 2)
+                            half_h = max(20, h // 2)
+                            left = max(cx - half_w, 0)
+                            top = max(cy - half_h, 0)
+                            right = min(cx + half_w, sw)
+                            bottom = min(cy + half_h, sh)
+                            return (left, top, max(1, right - left), max(1, bottom - top))
+
                         if next_side == "B":
-                            box = locate_image_center(screen, self.buy_image_path, CLICK_CONFIDENCE)
-                            center = screen.center_of(box) if box else None
-                            if center:
-                                x, y = center
-                                screen.move_to(x, y, duration=0.2)
-                                screen.click(x, y)
-                                self.last_trade_at = now
-                                log(f"Executed BUY at {now.strftime('%H:%M:%S')} (clicked at {center})")
-                            else:
-                                log("BUY button not found at execution time. Skipping.")
+                            rx, ry = buy_center
+                            region = region_around(rx, ry)
+                            box = locate_image_center(screen, self.buy_image_path, CLICK_CONFIDENCE, region=region)
+                            center = screen.center_of(box) if box else buy_center  # fallback to stored center
+                            x, y = center
+                            screen.move_to(x, y, duration=0.2)
+                            screen.click(x, y)
+                            self.last_trade_at = now
+                            log(f"Executed BUY at {now.strftime('%H:%M:%S')} (clicked at {center})")
                         else:
-                            box = locate_image_center(screen, self.sell_image_path, CLICK_CONFIDENCE)
-                            center = screen.center_of(box) if box else None
-                            if center:
-                                x, y = center
-                                screen.move_to(x, y, duration=0.2)
-                                screen.click(x, y)
-                                self.last_trade_at = now
-                                log(f"Executed SELL at {now.strftime('%H:%M:%S')} (clicked at {center})")
-                            else:
-                                log("SELL button not found at execution time. Skipping.")
+                            rx, ry = sell_center
+                            region = region_around(rx, ry)
+                            box = locate_image_center(screen, self.sell_image_path, CLICK_CONFIDENCE, region=region)
+                            center = screen.center_of(box) if box else sell_center  # fallback to stored center
+                            x, y = center
+                            screen.move_to(x, y, duration=0.2)
+                            screen.click(x, y)
+                            self.last_trade_at = now
+                            log(f"Executed SELL at {now.strftime('%H:%M:%S')} (clicked at {center})")
                     except Exception as e:
                         log(f"Error during click: {e}")
 
