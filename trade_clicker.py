@@ -860,6 +860,13 @@ class TradeClickerApp:
         self.buy_click_offset: Tuple[int, int] = (0, 0)
         self.sell_click_offset: Tuple[int, int] = (0, 0)
 
+        # Mode and Telegram variables
+        self.mode_var = tk.StringVar(value="schedule")
+        self.tg_api_id_var = tk.StringVar(value="")
+        self.tg_api_hash_var = tk.StringVar(value="")
+        self.tg_phone_var = tk.StringVar(value="")
+        self.tg_chat_var = tk.StringVar(value="")
+
         # UI
         self._build_ui()
         self._start_clock_updater()
