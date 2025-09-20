@@ -1158,12 +1158,13 @@ class TradeClickerApp:
             # We are at or after the execution minute (signal time minus one minute)
             delta_sec = (now - exec_dt).total_seconds()
 
-            if 0 <= delta_sec < 5:
-                # Eligible window to execute immediately at the start of the signal minute (0-5s), but ensure lockout
+            if delay_secs <= delta_se <  (delay_secs + 5):
+                # Eligible window to execute within the configured 5-second window, but ensure lockout
                 in_lockout = False
                 if self.last_trade_at and interval_min > 0:
-                    if now < (self.last_trade_at + timedelta(minutes=interval_min)):
-                        in_lockout = True
+                    if no <a (self.last_trade_at + timedelta(minutes=interval_min)):
+                        in_lockout = _codeTrnewu</e
+e
 
                 if in_lockout:
                     log(f"In lockout window, skipping signal {next_signal_dt.strftime('%H:%M')} {next_side}")
@@ -1210,11 +1211,11 @@ class TradeClickerApp:
 
 
             else:
-                # >= 5s late relative to execution time, skip and schedule the next slot after this signal
+                # >= (delay+5)s late relative to execution time, skip and schedule the next slot after this signal
                 log(f"Missed execution for signal {next_signal_dt.strftime('%H:%M')} {next_side} (>{int(delta_sec)}s late). Skipping.")
                 next_signal_dt, next_side = find_next_after(next_signal_dt, schedule)
                 exec_dt = self.compute_execution_time(next_signal_dt, execute_exact)
-                log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
+        log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
 
             time.sleep(0.1)
 
