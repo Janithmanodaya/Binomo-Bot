@@ -220,23 +220,88 @@ def find_next_signal(now_dt: datetime, schedule: List[Tuple[int, int, str]]) -> 
 
 # --------------- Image Recognition and Clicking ---------------
 
-def locate_image_center(path: str, confidence: Optional[float] = None) -> Optional[Tuple[int, int, int, int]]:
+class ScreenAutomation:
+    """
+    Abstraction over screen search and clicking.
+    Tries to use pyautogui if available; otherwise falls back to pyscreeze + pydirectinput.
+    """
+
+    def __init__(self, log=None):
+        self.log = log or (lambda *a, **k: None)
+        self.backend = None  # "pyautogui" or "fallback"
+        self.pg = None
+        self.pyscreeze = None
+        self.direct = None
+
+        # Try pyautogui first
+        try:
+            self.pg = ensure_package("pyautogui", "pyautogui", self.log)
+            self.backend = "pyautogui"
+            self.log("Using pyautogui backend.")
+        except Exception:
+            # Fallback: use pyscreeze + pydirectinput
+            self.pyscreeze = ensure_package("pyscreeze", "pyscreeze", self.log)
+            # PIL (Pillow) is required by pyscreeze.screenshot
+            ensure_package("PIL", "pillow", self.log)
+            # pydirectinput for sending clicks/moves
+            self.direct = ensure_package("pydirectinput", "pydirectinput", self.log)
+            # Optional: OpenCV to allow confidence param in locateOnScreen
+            try:
+                ensure_package("cv2", "opencv-python", self.log)
+            except Exception:
+                pass
+            self.backend = "fallback"
+            self.log("Using fallback backend (pyscreeze + pydirectinput).")
+
+    def locate_on_screen(self, image_path: str, confidence: Optional[float] = None):
+        if self.backend == "pyautogui":
+            try:
+                if confidence is not None:
+                    return self.pg.locateOnScreen(image_path, confidence=confidence)
+                return self.pg.locateOnScreen(image_path)
+            except TypeError:
+                return self.pg.locateOnScreen(image_path)
+        else:
+            # pyscreeze.locateOnScreen supports confidence if OpenCV is available
+            try:
+                if confidence is not None:
+                    return self.pyscreeze.locateOnScreen(image_path, confidence=confidence)
+                return self.pyscreeze.locateOnScreen(image_path)
+            except TypeError:
+                return self.pyscreeze.locateOnScreen(image_path)
+
+    @staticmethod
+    def center_of(box):
+        # box is either a pyscreeze.Box or tuple (left, top, width, height)
+        left, top, width, height = box
+        cx = int(left + width / 2)
+        cy = int(top + height / 2)
+        return cx, cy
+
+    def move_to(self, x: int, y: int, duration: float = 0.2):
+        if self.backend == "pyautogui":
+            self.pg.moveTo(x, y, duration=duration)
+        else:
+            # pydirectinput has moveTo but no smooth duration; emulate with sleep
+            self.direct.moveTo(x, y)
+            if duration:
+                time.sleep(duration)
+
+    def click(self, x: int, y: int):
+        if self.backend == "pyautogui":
+            self.pg.click(x, y)
+        else:
+            self.direct.click(x=x, y=y)
+
+def locate_image_center(screen: "ScreenAutomation", path: str, confidence: Optional[float] = None) -> Optional[Tuple[int, int, int, int]]:
     """
     Locate image on screen. Returns a Box (left, top, width, height) or None.
     If confidence is provided and OpenCV is available, uses that confidence.
     """
-    try:
-        if confidence is not None:
-            box = pyautogui.locateOnScreen(path, confidence=confidence)
-        else:
-            box = pyautogui.locateOnScreen(path)
-    except TypeError:
-        # Installed PyAutoGUI without OpenCV; retry without confidence
-        box = pyautogui.locateOnScreen(path)
-    return box
+    return screen.locate_on_screen(path, confidence=confidence)
 
 
-def wait_for_images(buy_img: str, sell_img: str, log, stop_event: threading.Event) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log, stop_event: threading.Event) -> Tuple[Tuple[int, int], Tuple[int, int]]:
     """
     Wait until both Buy and Sell images are located on the screen.
     Returns center points for both as ((x,y)_buy, (x,y)_sell).
@@ -250,15 +315,15 @@ def wait_for_images(buy_img: str, sell_img: str, log, stop_event: threading.Even
             raise TimeoutError("Timed out waiting for Buy/Sell buttons on screen.")
 
         if buy_center is None:
-            box = locate_image_center(buy_img, CLICK_CONFIDENCE)
+            box = locate_image_center(screen, buy_img, CLICK_CONFIDENCE)
             if box:
-                bx, by = pyautogui.center(box)
+                bx, by = screen.center_of(box)
                 buy_center = (bx, by)
                 log(f"Identified BUY button at {buy_center}")
         if sell_center is None:
-            box = locate_image_center(sell_img, CLICK_CONFIDENCE)
+            box = locate_image_center(screen, sell_img, CLICK_CONFIDENCE)
             if box:
-                sx, sy = pyautogui.center(box)
+                sx, sy = screen.center_of(box)
                 sell_center = (sx, sy)
                 log(f"Identified SELL button at {sell_center}")
 
@@ -459,26 +524,13 @@ class TradeClickerApp:
         def log(msg: str):
             self.root.after(0, self.log, msg)
 
-        # Ensure required libraries (auto-install after Start)
+        # Prepare screen automation backend (auto-installs required packages)
         try:
-            mod = ensure_package("pyautogui", "pyautogui", log)
-            global pyautogui
-            pyautogui = mod
-            log("pyautogui is ready.")
+            screen = ScreenAutomation(log=log)
         except Exception as e:
-            log(f"pyautogui installation failed: {e}")
+            log(f"Failed to prepare screen automation backend: {e}")
             self.root.after(0, self.on_stop)
             return
-
-        # Try to ensure OpenCV for better image matching (optional)
-        try:
-            importlib.import_module("cv2")
-        except ImportError:
-            try:
-                ensure_package("cv2", "opencv-python", log)
-                log("Installed opencv-python for better image matching.")
-            except Exception as e:
-                log(f"OpenCV not available (optional): {e}")
 
         # Ensure internet time available
         log("Connecting to internet time service...")
@@ -503,7 +555,7 @@ class TradeClickerApp:
         # Identify Buy/Sell buttons
         log("Waiting for BUY and SELL buttons to appear on screen...")
         try:
-            buy_center, sell_center = wait_for_images(self.buy_image_path, self.sell_image_path, log, self.stop_event)
+            buy_center, sell_center = wait_for_images(screen, self.buy_image_path, self.sell_image_path, log, self.stop_event)
             log("Both buttons identified.")
         except Exception as e:
             log(f"Error identifying buttons: {e}")
@@ -551,23 +603,23 @@ class TradeClickerApp:
                     # Re-locate before clicking in case layout moved
                     try:
                         if next_side == "B":
-                            box = locate_image_center(self.buy_image_path, CLICK_CONFIDENCE)
-                            center = pyautogui.center(box) if box else None
+                            box = locate_image_center(screen, self.buy_image_path, CLICK_CONFIDENCE)
+                            center = screen.center_of(box) if box else None
                             if center:
                                 x, y = center
-                                pyautogui.moveTo(x, y, duration=0.2)
-                                pyautogui.click(x, y)
+                                screen.move_to(x, y, duration=0.2)
+                                screen.click(x, y)
                                 self.last_trade_at = now
                                 log(f"Executed BUY at {now.strftime('%H:%M:%S')} (clicked at {center})")
                             else:
                                 log("BUY button not found at execution time. Skipping.")
                         else:
-                            box = locate_image_center(self.sell_image_path, CLICK_CONFIDENCE)
-                            center = pyautogui.center(box) if box else None
+                            box = locate_image_center(screen, self.sell_image_path, CLICK_CONFIDENCE)
+                            center = screen.center_of(box) if box else None
                             if center:
                                 x, y = center
-                                pyautogui.moveTo(x, y, duration=0.2)
-                                pyautogui.click(x, y)
+                                screen.move_to(x, y, duration=0.2)
+                                screen.click(x, y)
                                 self.last_trade_at = now
                                 log(f"Executed SELL at {now.strftime('%H:%M:%S')} (clicked at {center})")
                             else:
