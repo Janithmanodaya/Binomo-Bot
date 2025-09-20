@@ -37,7 +37,13 @@ def ensure_dirs():
 
 
 def utc_ms(dt: pd.Timestamp) -> int:
-    return int(pd.Timestamp(dt, tz="UTC").value // 1_000_000)
+    ts = pd.Timestamp(dt)
+    # If naive, assume UTC; if tz-aware, convert to UTC
+    if ts.tzinfo is None or ts.tz is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return int(ts.value // 1_000_000)
 
 
 def fetch_ohlcv_ccxt(symbol: str, days: int, exchange: str = "binance") -> pd.DataFrame:
@@ -49,7 +55,8 @@ def fetch_ohlcv_ccxt(symbol: str, days: int, exchange: str = "binance") -> pd.Da
     ex = ccxt.binance({"enableRateLimit": True})
     timeframe = "1m"
     limit = 1000
-    since = utc_ms(pd.Timestamp.utcnow().tz_convert("UTC") - pd.Timedelta(days=days))
+    # Use timezone-aware current time in UTC
+    since = utc_ms(pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days))
 
     all_rows: List[List[float]] = []
     while True:
