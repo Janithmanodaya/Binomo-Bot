@@ -1027,8 +1027,8 @@ class TradeClickerApp:
                     except Exception as e:
                         log(f"Error during click: {e}")
 
-                # Regardless, schedule next signal
-                next_signal_dt, next_side = find_next_signal(now, schedule)
+                # Regardless, schedule next signal strictly after the one we just handled
+                next_signal_dt, next_side = find_next_after(next_signal_dt, schedule)
                 exec_dt = next_signal_dt - timedelta(minutes=1)
                 log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
 
