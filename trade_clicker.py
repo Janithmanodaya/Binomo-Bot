@@ -318,7 +318,23 @@ class ScreenAutomation:
             self.backend = "fallback"
             self.log("Using fallback backend (pyscreeze + pydirectinput).")
 
-    def locate_on_screen(self, image_path: str, confidence: Optional[float] = None):
+    def screen_size(self) -> Tuple[int, int]:
+        """Return (width, height) of the primary screen."""
+        if self.backend == "pyautogui":
+            try:
+                size = self.pg.size()
+                return int(size[0]), int(size[1])
+            except Exception:
+                pass
+        # fallback using pyscreeze screenshot
+        try:
+            im = self.pyscreeze.screenshot() if self.pyscreeze else self.pg.screenshot()
+            return im.size[0], im.size[1]
+        except Exception:
+            # Conservative default full HD
+            return 1920, 1080
+
+    def locate_on_screen(self, image_path: str, confidence: Optional[float] = None, region: Optional[Tuple[int, int, int, int]] = None):
         # Only pass confidence if cv2 is available
         if not self.has_confidence:
             confidence = None
@@ -330,16 +346,20 @@ class ScreenAutomation:
 
         if self.backend == "pyautogui":
             try:
+                kwargs = {}
                 if confidence is not None:
-                    return self.pg.locateOnScreen(image_path, confidence=confidence)
-                return self.pg.locateOnScreen(image_path)
+                    kwargs["confidence"] = confidence
+                if region is not None:
+                    kwargs["region"] = region
+                return self.pg.locateOnScreen(image_path, **kwargs)
             except Exception as e:
                 # If it's the "not found" case, return None instead of raising
                 if _is_not_found(e):
                     return None
                 # Retry once without confidence (in case confidence unsupported), then handle not-found again
                 try:
-                    return self.pg.locateOnScreen(image_path)
+                    kwargs.pop("confidence", None)
+                    return self.pg.locateOnScreen(image_path, **kwargs)
                 except Exception as e2:
                     if _is_not_found(e2):
                         return None
@@ -347,14 +367,18 @@ class ScreenAutomation:
         else:
             # pyscreeze.locateOnScreen supports confidence if OpenCV is available
             try:
+                kwargs = {}
                 if confidence is not None:
-                    return self.pyscreeze.locateOnScreen(image_path, confidence=confidence)
-                return self.pyscreeze.locateOnScreen(image_path)
+                    kwargs["confidence"] = confidence
+                if region is not None:
+                    kwargs["region"] = region
+                return self.pyscreeze.locateOnScreen(image_path, **kwargs)
             except Exception as e:
                 if _is_not_found(e):
                     return None
                 try:
-                    return self.pyscreeze.locateOnScreen(image_path)
+                    kwargs.pop("confidence", None)
+                    return self.pyscreeze.locateOnScreen(image_path, **kwargs)
                 except Exception as e2:
                     if _is_not_found(e2):
                         return None
@@ -383,20 +407,26 @@ class ScreenAutomation:
         else:
             self.direct.click(x=x, y=y)
 
-def locate_image_center(screen: "ScreenAutomation", path: str, confidence: Optional[float] = None) -> Optional[Tuple[int, int, int, int]]:
+def locate_image_center(screen: "ScreenAutomation", path: str, confidence: Optional[float] = None, region: Optional[Tuple[int, int, int, int]] = None) -> Optional[Tuple[int, int, int, int]]:
     """
     Locate image on screen. Returns a Box (left, top, width, height) or None.
     If confidence is provided and OpenCV is available, uses that confidence.
+    Optionally restrict search to a region=(left, top, width, height).
     """
-    return screen.locate_on_screen(path, confidence=confidence)
+    return screen.locate_on_screen(path, confidence=confidence, region=region)
 
 
 def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log, stop_event: threading.Event) -> Tuple[Tuple[int, int], Tuple[int, int]]:
     """
     Wait until both Buy and Sell images are located on the screen.
+    Ensures the two matches are different on-screen locations. If both initially
+    resolve to the same area, retries the second search excluding a small region
+    around the first match.
     Returns center points for both as ((x,y)_buy, (x,y)_sell).
     """
     start = time.time()
+    buy_box = None
+    sell_box = None
     buy_center = None
     sell_center = None
 
@@ -404,18 +434,70 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
         if time.time() - start > IMAGE_SEARCH_TIMEOUT:
             raise TimeoutError("Timed out waiting for Buy/Sell buttons on screen.")
 
+        # Try find BUY if missing
         if buy_center is None:
             box = locate_image_center(screen, buy_img, CLICK_CONFIDENCE)
             if box:
                 bx, by = screen.center_of(box)
+                buy_box = box
                 buy_center = (bx, by)
                 log(f"Identified BUY button at {buy_center}")
+
+        # Try find SELL if missing
         if sell_center is None:
+            # If BUY is found and subsequent SELL search lands on the same box,
+            # re-search SELL while excluding a small region around BUY.
             box = locate_image_center(screen, sell_img, CLICK_CONFIDENCE)
             if box:
                 sx, sy = screen.center_of(box)
+                sell_box = box
                 sell_center = (sx, sy)
                 log(f"Identified SELL button at {sell_center}")
+
+        # If both found but centers are identical, attempt a disambiguation pass
+        if buy_center and sell_center and buy_center == sell_center:
+            # Exclude a small rectangle around the first (BUY) and re-search SELL
+            width, height = screen.screen_size()
+            # Exclusion margin around the first center
+            ex_w = 80
+            ex_h = 80
+            bx, by = buy_center
+            ex_left = max(bx - ex_w // 2, 0)
+            ex_top = max(by - ex_h // 2, 0)
+            ex_right = min(bx + ex_w // 2, width)
+            ex_bottom = min(by + ex_h // 2, height)
+
+            # Build up to 4 regions around the exclusion zone
+            regions = []
+            # Top region
+            if ex_top > 0:
+                regions.append((0, 0, width, ex_top))
+            # Bottom region
+            if ex_bottom < height:
+                regions.append((0, ex_bottom, width, height - ex_bottom))
+            # Left region
+            if ex_left > 0:
+                regions.append((0, ex_top, ex_left, ex_bottom - ex_top))
+            # Right region
+            if ex_right < width:
+                regions.append((ex_right, ex_top, width - ex_right, ex_bottom - ex_top))
+
+            found_alt = None
+            for r in regions:
+                alt_box = locate_image_center(screen, sell_img, CLICK_CONFIDENCE, region=r)
+                if alt_box:
+                    found_alt = alt_box
+                    break
+
+            if found_alt:
+                sx, sy = screen.center_of(found_alt)
+                sell_box = found_alt
+                sell_center = (sx, sy)
+                log(f"Adjusted SELL match to {sell_center}")
+            else:
+                # Could not disambiguate now; clear SELL and retry in next loop
+                sell_center = None
+                sell_box = None
 
         if buy_center and sell_center:
             return buy_center, sell_center
@@ -650,6 +732,9 @@ class TradeClickerApp:
                 raise FileNotFoundError(f"Buy image not found: {self.buy_image_path}")
             if not os.path.isfile(self.sell_image_path):
                 raise FileNotFoundError(f"Sell image not found: {self.sell_image_path}")
+            # Prevent using the same file for both buttons
+            if os.path.samefile(self.buy_image_path, self.sell_image_path):
+                raise ValueError("Buy and Sell images are the same file. Please select two different images.")
 
             buy_center, sell_center = wait_for_images(screen, self.buy_image_path, self.sell_image_path, log, self.stop_event)
             log("Both buttons identified.")
