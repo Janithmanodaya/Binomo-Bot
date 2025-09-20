@@ -13,12 +13,12 @@ Quick start
 1) Install dependencies
    pip install -r requirements.txt
 
-2) Run the pipeline with defaults (BTC/USDT on Binance, ~60 days of data)
+2) Run the pipeline with defaults (ETH/USDT on Binance, ~60 days of data)
    python src/run_pipeline.py
 
 Common options (examples)
 - Change symbol:
-   python src/run_pipeline.py --symbol BTC/USDT
+   python src/run_pipeline.py --symbol ETH/USDT
 
 - Change lookback duration:
    python src/run_pipeline.py --days 120

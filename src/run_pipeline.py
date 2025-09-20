@@ -420,7 +420,7 @@ def run_pipeline(
 
 def parse_args():
     p = argparse.ArgumentParser(description="Cost-aware 1-minute crypto direction baseline with LightGBM")
-    p.add_argument("--symbol", type=str, default="BTC/USDT", help="Symbol on Binance spot, e.g., BTC/USDT")
+    p.add_argument("--symbol", type=str, default="ETH/USDT", help="Symbol on Binance spot, e.g., ETH/USDT")
     p.add_argument("--days", type=int, default=60, help="Lookback days of 1m OHLCV to fetch")
     p.add_argument("--taker-fee-bps", type=float, default=4.0, help="Taker fee per side (bps)")
     p.add_argument("--slippage-bps", type=float, default=1.0, help="Slippage per side (bps)")
