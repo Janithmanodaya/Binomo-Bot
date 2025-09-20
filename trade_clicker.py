@@ -524,6 +524,24 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
     Returns center points for both as ((x,y)_buy, (x,y)_sell).
     """
     start = time.time()
+    last_status_log = 0.0
+
+    def locate_with_fallbacks(img_path: str, region: Optional[Tuple[int, int, int, int]] = None):
+        # Try with progressively lower confidence if OpenCV is available
+        if screen.has_confidence:
+            tried = set()
+            for conf in (CLICK_CONFIDENCE, 0.75, 0.7, 0.65, 0.6):
+                c = max(0.0, min(1.0, conf))
+                if c in tried:
+                    continue
+                tried.add(c)
+                box = locate_image_center(screen, img_path, c, region)
+                if box:
+                    return box
+            return None
+        else:
+            return locate_image_center(screen, img_path, None, region)
+
     buy_box = None
     sell_box = None
     buy_center = None
@@ -535,7 +553,7 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
 
         # Try find BUY if missing
         if buy_center is None:
-            box = locate_image_center(screen, buy_img, CLICK_CONFIDENCE)
+            box = locate_with_fallbacks(buy_img)
             if box:
                 # Accept the first reasonable match. We'll use color later as a hint,
                 # but do not block progress here to avoid infinite waiting.
@@ -546,7 +564,7 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
 
         # Try find SELL if missing
         if sell_center is None:
-            box = locate_image_center(screen, sell_img, CLICK_CONFIDENCE)
+            box = locate_with_fallbacks(sell_img)
             if box:
                 sx, sy = screen.center_of(box)
 
@@ -573,7 +591,7 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
 
                     found_alt = None
                     for r in regions:
-                        alt_box = locate_image_center(screen, sell_img, CLICK_CONFIDENCE, region=r)
+                        alt_box = locate_with_fallbacks(sell_img, region=r)
                         if alt_box:
                             # Optional: quick color sanity for SELL
                             color = screen.classify_box_color(alt_box)
@@ -591,6 +609,10 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
                         # Don't log the overlapping SELL; wait and try again next iteration
                         sell_center = None
                         sell_box = None
+                else:
+                    sell_box = box
+                    sell_center = (sx, sy)
+                    log(f"Identified SELL button at {sell_center}")
 
         # If both found but centers are identical, attempt a disambiguation pass
         if buy_center and sell_center and buy_center == sell_center:
@@ -622,7 +644,7 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
 
             found_alt = None
             for r in regions:
-                alt_box = locate_image_center(screen, sell_img, CLICK_CONFIDENCE, region=r)
+                alt_box = locate_with_fallbacks(sell_img, region=r)
                 if alt_box:
                     # Validate color for SELL
                     color = screen.classify_box_color(alt_box)
@@ -659,6 +681,18 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
 
         if buy_center and sell_center:
             return buy_center, sell_center
+
+        # Periodic status logs so the user sees progress
+        now_ts = time.time()
+        if now_ts - last_status_log > 2.0:
+            missing = []
+            if buy_center is None:
+                missing.append("BUY")
+            if sell_center is None:
+                missing.append("SELL")
+            if missing:
+                log(f"Still searching for: {', '.join(missing)}...")
+            last_status_log = now_ts
 
         time.sleep(IMAGE_SEARCH_INTERVAL)
 
