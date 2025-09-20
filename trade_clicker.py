@@ -323,22 +323,39 @@ class ScreenAutomation:
         if not self.has_confidence:
             confidence = None
 
+        # We must not propagate ImageNotFoundException; return None instead so callers can poll.
         if self.backend == "pyautogui":
+            box = None
             try:
                 if confidence is not None:
-                    return self.pg.locateOnScreen(image_path, confidence=confidence)
-                return self.pg.locateOnScreen(image_path)
+                    box = self.pg.locateOnScreen(image_path, confidence=confidence)
+                else:
+                    box = self.pg.locateOnScreen(image_path)
             except Exception:
-                # Retry without confidence if backend complains
-                return self.pg.locateOnScreen(image_path)
+                box = None
+            # If nothing found and we tried with confidence, try once more without it.
+            if box is None and confidence is not None:
+                try:
+                    box = self.pg.locateOnScreen(image_path)
+                except Exception:
+                    box = None
+            return box
         else:
             # pyscreeze.locateOnScreen supports confidence if OpenCV is available
+            box = None
             try:
                 if confidence is not None:
-                    return self.pyscreeze.locateOnScreen(image_path, confidence=confidence)
-                return self.pyscreeze.locateOnScreen(image_path)
+                    box = self.pyscreeze.locateOnScreen(image_path, confidence=confidence)
+                else:
+                    box = self.pyscreeze.locateOnScreen(image_path)
             except Exception:
-                return self.pyscreeze.locateOnScreen(image_path)
+                box = None
+            if box is None and confidence is not None:
+                try:
+                    box = self.pyscreeze.locateOnScreen(image_path)
+                except Exception:
+                    box = None
+            return box
 
     @staticmethod
     def center_of(box):
