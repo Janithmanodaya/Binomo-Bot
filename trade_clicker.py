@@ -274,6 +274,14 @@ class ScreenAutomation:
         self.pg = None
         self.pyscreeze = None
         self.direct = None
+        self.has_confidence = False  # True if OpenCV is available
+
+        # Detect OpenCV availability
+        try:
+            importlib.import_module("cv2")
+            self.has_confidence = True
+        except ImportError:
+            self.has_confidence = False
 
         # Try pyautogui first WITHOUT installing, to avoid unnecessary installs
         try:
@@ -304,23 +312,23 @@ class ScreenAutomation:
             except ImportError:
                 raise RuntimeError("pydirectinput not installed. Please install it or install pyautogui.")
 
-            # Optional: OpenCV to allow confidence param in locateOnScreen
-            try:
-                importlib.import_module("cv2")
-            except ImportError:
-                # fine; confidence search may be limited
-                pass
+            # Optional: OpenCV to allow confidence param in locateOnScreen (already detected)
 
             self.backend = "fallback"
             self.log("Using fallback backend (pyscreeze + pydirectinput).")
 
     def locate_on_screen(self, image_path: str, confidence: Optional[float] = None):
+        # Only pass confidence if cv2 is available
+        if not self.has_confidence:
+            confidence = None
+
         if self.backend == "pyautogui":
             try:
                 if confidence is not None:
                     return self.pg.locateOnScreen(image_path, confidence=confidence)
                 return self.pg.locateOnScreen(image_path)
-            except TypeError:
+            except Exception:
+                # Retry without confidence if backend complains
                 return self.pg.locateOnScreen(image_path)
         else:
             # pyscreeze.locateOnScreen supports confidence if OpenCV is available
@@ -328,7 +336,7 @@ class ScreenAutomation:
                 if confidence is not None:
                     return self.pyscreeze.locateOnScreen(image_path, confidence=confidence)
                 return self.pyscreeze.locateOnScreen(image_path)
-            except TypeError:
+            except Exception:
                 return self.pyscreeze.locateOnScreen(image_path)
 
     @staticmethod
