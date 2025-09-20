@@ -54,20 +54,67 @@ LOG_MAX_LINES = 500
 def ensure_package(import_name: str, pip_name: Optional[str] = None, log=None):
     """
     Ensure a Python package is importable. If not, install via pip and import it.
+    Tries several strategies to improve success on Windows and newer Python versions.
     """
     try:
         return importlib.import_module(import_name)
     except ImportError:
+        pkg = pip_name or import_name
         if log:
             try:
-                log(f"Installing dependency: {pip_name or import_name} ...")
+                log(f"Installing dependency: {pkg} ...")
             except Exception:
                 pass
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name or import_name])
-        except Exception as e:
-            raise RuntimeError(f"Failed to install {pip_name or import_name}: {e}")
-        return importlib.import_module(import_name)
+
+        def run_pip(args):
+            cmd = [sys.executable, "-m", "pip"] + args
+            return subprocess.call(cmd)  # return code only
+
+        # 1) Try plain install
+        rc = run_pip(["install", pkg])
+        if rc == 0:
+            return importlib.import_module(import_name)
+
+        # 2) Upgrade pip/setuptools/wheel then retry
+        if log:
+            log("Upgrading pip/setuptools/wheel and retrying...")
+        run_pip(["install", "--upgrade", "pip", "setuptools", "wheel"])
+        rc = run_pip(["install", pkg])
+        if rc == 0:
+            return importlib.import_module(import_name)
+
+        # 3) Try --user
+        if log:
+            log("Retrying with --user ...")
+        rc = run_pip(["install", "--user", pkg])
+        if rc == 0:
+            return importlib.import_module(import_name)
+
+        # 4) Special handling for pyautogui: install its dependencies individually then retry
+        if pkg.lower() in {"pyautogui", "pyautoGUI".lower()}:
+            if log:
+                log("Installing PyAutoGUI dependencies individually...")
+            deps = ["pillow", "pyscreeze", "pygetwindow", "pymsgbox", "mouseinfo", "pyrect"]
+            for d in deps:
+                run_pip(["install", d])
+            # Retry pyautogui once more
+            rc = run_pip(["install", pkg])
+            if rc == 0:
+                return importlib.import_module(import_name)
+
+        # 5) Try pinning a common stable version (best-effort)
+        pinned_versions = {
+            "pyautogui": ["0.9.54", "0.9.53"],
+        }
+        if pkg.lower() in pinned_versions:
+            for ver in pinned_versions[pkg.lower()]:
+                if log:
+                    log(f"Retrying {pkg}=={ver} ...")
+                rc = run_pip(["install", f"{pkg}=={ver}"])
+                if rc == 0:
+                    return importlib.import_module(import_name)
+
+        raise RuntimeError(f"Failed to install {pkg}")
 
 # --------------- Utilities ---------------
 
