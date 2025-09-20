@@ -323,22 +323,42 @@ class ScreenAutomation:
         if not self.has_confidence:
             confidence = None
 
+        # Helper to decide if an exception is the "not found" case
+        def _is_not_found(exc: Exception) -> bool:
+            name = exc.__class__.__name__
+            return name == "ImageNotFoundException"
+
         if self.backend == "pyautogui":
             try:
                 if confidence is not None:
                     return self.pg.locateOnScreen(image_path, confidence=confidence)
                 return self.pg.locateOnScreen(image_path)
-            except Exception:
-                # Retry without confidence if backend complains
-                return self.pg.locateOnScreen(image_path)
+            except Exception as e:
+                # If it's the "not found" case, return None instead of raising
+                if _is_not_found(e):
+                    return None
+                # Retry once without confidence (in case confidence unsupported), then handle not-found again
+                try:
+                    return self.pg.locateOnScreen(image_path)
+                except Exception as e2:
+                    if _is_not_found(e2):
+                        return None
+                    raise
         else:
             # pyscreeze.locateOnScreen supports confidence if OpenCV is available
             try:
                 if confidence is not None:
                     return self.pyscreeze.locateOnScreen(image_path, confidence=confidence)
                 return self.pyscreeze.locateOnScreen(image_path)
-            except Exception:
-                return self.pyscreeze.locateOnScreen(image_path)
+            except Exception as e:
+                if _is_not_found(e):
+                    return None
+                try:
+                    return self.pyscreeze.locateOnScreen(image_path)
+                except Exception as e2:
+                    if _is_not_found(e2):
+                        return None
+                    raise
 
     @staticmethod
     def center_of(box):
