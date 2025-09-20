@@ -902,7 +902,10 @@ class TradeClickerApp:
                 messagebox.showwarning("Invalid Offsets", "Offsets must be integers (pixels).")
                 return
         else:
+            bdx = bdy = sdx = sdy = 0
 
+        self.buy_click_offset = (bdx, bdy)
+        self.sell_click_offset = (sdx, sdy)
 
         schedule_text = self.schedule_text.get("1.0", "end")
         schedule = parse_schedule(schedule_text)
