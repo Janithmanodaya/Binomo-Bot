@@ -1,0 +1,514 @@
+"""
+Trade Clicker - Time-based auto clicker with image recognition and Sri Lanka virtual time.
+
+Features:
+- Beautiful Tkinter UI (ttk styling)
+- Select Buy/Sell image files (used by pyautogui to locate buttons on screen)
+- Enter a URL to open in the default external browser on Start
+- Uses internet time for Asia/Colombo (GMT+5:30) via worldtimeapi.org (does not rely on system time)
+- Displays live Sri Lanka time clock in UI
+- Paste a schedule like:
+    01:00 S
+    01:05 B
+    01:10 B
+  The app will:
+    * Find the next signal time greater than current time
+    * Wait until that time, then wait 5 seconds and click the correct image/button
+    * If the signal is more than 10 seconds late (>= HH:MM:10), it skips the trade
+    * Optional interval lockout (e.g., 15 min) to avoid opening another trade too soon
+
+Notes:
+- pyautogui image search with "confidence" requires opencv-python to be installed.
+  Without it, only exact image matches will work.
+- Ensure your Buy/Sell images clearly match the on-screen buttons (same resolution/scale).
+"""
+
+import threading
+import time
+import webbrowser
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Tuple
+import json
+import urllib.request
+import urllib.error
+import pyautogui
+import os
+import sys
+
+# --------------- Configuration ---------------
+
+WORLD_TIME_API = "http://worldtimeapi.org/api/timezone/Asia/Colombo"
+TIME_RESYNC_SECONDS = 30  # periodically re-sync virtual time from internet
+IMAGE_SEARCH_INTERVAL = 1.5  # seconds between image search attempts
+IMAGE_SEARCH_TIMEOUT = 300  # max seconds to wait for locating both buttons (5 minutes)
+CLICK_CONFIDENCE = 0.8  # used if OpenCV is available
+LOG_MAX_LINES = 500
+
+# --------------- Utilities ---------------
+
+class InternetTimeProvider:
+    """Provides virtual time for Sri Lanka (Asia/Colombo) using internet, not system time."""
+
+    def __init__(self):
+        self._offset = timedelta(0)  # offset to apply to system time to map to Colombo internet time
+        self._last_sync = 0.0
+
+    def _fetch_colombo_time(self) -> datetime:
+        """Fetch current Colombo time from worldtimeapi.org."""
+        req = urllib.request.Request(WORLD_TIME_API, headers={"User-Agent": "trade-clicker/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        # datetime example: "2023-09-20T12:34:56.789012+05:30"
+        dt_str = data.get("datetime")
+        if not dt_str:
+            raise RuntimeError("Invalid response from time API: missing 'datetime'")
+        # Parse ISO 8601 with timezone
+        # Python fromisoformat supports "+05:30"
+        dt = datetime.fromisoformat(dt_str)
+        return dt
+
+    def sync(self):
+        """Sync offset between system time and true Colombo time."""
+        colombo_now = self._fetch_colombo_time()
+        system_now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+        # Convert system UTC to Colombo time using API's tzinfo offset
+        colombo_offset = colombo_now.utcoffset() or timedelta(hours=5, minutes=30)
+        system_as_colombo = system_now_utc.astimezone(timezone(colombo_offset))
+        self._offset = colombo_now - system_as_colombo
+        self._last_sync = time.time()
+
+    def now(self) -> datetime:
+        """Return current virtual Colombo time. Re-sync periodically."""
+        try:
+            if (time.time() - self._last_sync) > TIME_RESYNC_SECONDS or self._last_sync == 0.0:
+                self.sync()
+        except Exception:
+            # If sync fails, keep previous offset and continue ticking locally
+            pass
+        # Use system time as base, apply offset to emulate Colombo internet time
+        system_now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+        # Use the last known Colombo offset to get tzinfo, default +05:30
+        tz = timezone(timedelta(hours=5, minutes=30))
+        system_as_colombo = system_now_utc.astimezone(tz)
+        return system_as_colombo + self._offset
+
+# --------------- Parsing and Scheduling ---------------
+
+def parse_schedule(text: str) -> List[Tuple[int, int, str]]:
+    """
+    Parse schedule lines like "01:10 B" or "23:45 S" (case-insensitive B/S).
+
+    Returns: list of tuples (hour, minute, side) where side in {"B", "S"} sorted by time.
+    """
+    entries = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        hhmm, side = parts
+        if ":" not in hhmm:
+            continue
+        try:
+            hh, mm = hhmm.split(":")
+            h = int(hh)
+            m = int(mm)
+            if not (0 <= h <= 23 and 0 <= m <= 59):
+                continue
+        except ValueError:
+            continue
+        side = side.upper()
+        if side not in {"B", "S"}:
+            continue
+        entries.append((h, m, side))
+    # Sort by hour, then minute
+    entries.sort(key=lambda x: (x[0], x[1]))
+    return entries
+
+
+def find_next_signal(now_dt: datetime, schedule: List[Tuple[int, int, str]]) -> Tuple[datetime, str]:
+    """
+    Given current datetime (Colombo) and schedule list, find the next signal datetime (today or next day) and side.
+    """
+    if not schedule:
+        raise ValueError("Schedule is empty.")
+    today = now_dt.date()
+    # Search today first
+    for h, m, side in schedule:
+        candidate = datetime(now_dt.year, now_dt.month, now_dt.day, h, m, 0, tzinfo=now_dt.tzinfo)
+        if candidate > now_dt:
+            return candidate, side
+    # If none left today, roll to tomorrow with first schedule item
+    h, m, side = schedule[0]
+    tomorrow = today + timedelta(days=1)
+    candidate = datetime(tomorrow.year, tomorrow.month, tomorrow.day, h, m, 0, tzinfo=now_dt.tzinfo)
+    return candidate, side
+
+# --------------- Image Recognition and Clicking ---------------
+
+def locate_image_center(path: str, confidence: Optional[float] = None) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Locate image on screen. Returns a Box (left, top, width, height) or None.
+    If confidence is provided and OpenCV is available, uses that confidence.
+    """
+    try:
+        if confidence is not None:
+            box = pyautogui.locateOnScreen(path, confidence=confidence)
+        else:
+            box = pyautogui.locateOnScreen(path)
+    except TypeError:
+        # Installed PyAutoGUI without OpenCV; retry without confidence
+        box = pyautogui.locateOnScreen(path)
+    return box
+
+
+def wait_for_images(buy_img: str, sell_img: str, log, stop_event: threading.Event) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    """
+    Wait until both Buy and Sell images are located on the screen.
+    Returns center points for both as ((x,y)_buy, (x,y)_sell).
+    """
+    start = time.time()
+    buy_center = None
+    sell_center = None
+
+    while not stop_event.is_set():
+        if time.time() - start > IMAGE_SEARCH_TIMEOUT:
+            raise TimeoutError("Timed out waiting for Buy/Sell buttons on screen.")
+
+        if buy_center is None:
+            box = locate_image_center(buy_img, CLICK_CONFIDENCE)
+            if box:
+                bx, by = pyautogui.center(box)
+                buy_center = (bx, by)
+                log(f"Identified BUY button at {buy_center}")
+        if sell_center is None:
+            box = locate_image_center(sell_img, CLICK_CONFIDENCE)
+            if box:
+                sx, sy = pyautogui.center(box)
+                sell_center = (sx, sy)
+                log(f"Identified SELL button at {sell_center}")
+
+        if buy_center and sell_center:
+            return buy_center, sell_center
+
+        time.sleep(IMAGE_SEARCH_INTERVAL)
+
+    raise RuntimeError("Stopped while waiting for images.")
+
+# --------------- UI App ---------------
+
+class TradeClickerApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("Trade Clicker - Sri Lanka Time")
+        self.root.geometry("900x650")
+        self.root.minsize(860, 600)
+
+        self.time_provider = InternetTimeProvider()
+
+        # State
+        self.buy_image_path: Optional[str] = None
+        self.sell_image_path: Optional[str] = None
+        self.worker_thread: Optional[threading.Thread] = None
+        self.stop_event = threading.Event()
+        self.last_trade_at: Optional[datetime] = None
+
+        # UI
+        self._build_ui()
+        self._start_clock_updater()
+
+    # ---------- UI Builders ----------
+
+    def _build_ui(self):
+        self.style = ttk.Style()
+        # Try a nicer theme if available
+        if "clam" in self.style.theme_names():
+            self.style.theme_use("clam")
+        # Style tweaks
+        self.style.configure("TButton", padding=6)
+        self.style.configure("TLabel", padding=4)
+        self.style.configure("Header.TLabel", font=("Segoe UI", 16, "bold"))
+        self.style.configure("Clock.TLabel", font=("Segoe UI", 14, "bold"), foreground="#0A8754")
+        self.style.configure("Log.TText", font=("Consolas", 10))
+
+        header = ttk.Frame(self.root, padding=10)
+        header.pack(fill="x")
+        ttk.Label(header, text="Trade Clicker", style="Header.TLabel").pack(side="left")
+        self.clock_var = tk.StringVar(value="--:--:--")
+        self.clock_label = ttk.Label(header, textvariable=self.clock_var, style="Clock.TLabel")
+        self.clock_label.pack(side="right")
+
+        # Settings frame
+        settings = ttk.LabelFrame(self.root, text="Settings", padding=10)
+        settings.pack(fill="x", padx=12, pady=8)
+
+        # URL input
+        ttk.Label(settings, text="URL:").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=4)
+        self.url_var = tk.StringVar()
+        self.url_entry = ttk.Entry(settings, textvariable=self.url_var, width=60)
+        self.url_entry.grid(row=0, column=1, sticky="we", pady=4)
+        settings.grid_columnconfigure(1, weight=1)
+
+        # Interval
+        ttk.Label(settings, text="Interval lockout (minutes):").grid(row=0, column=2, sticky="e", padx=(12, 6))
+        self.interval_var = tk.StringVar(value="0")
+        self.interval_entry = ttk.Entry(settings, textvariable=self.interval_var, width=8)
+        self.interval_entry.grid(row=0, column=3, sticky="w")
+
+        # Image selectors
+        img_frame = ttk.Frame(settings)
+        img_frame.grid(row=1, column=0, columnspan=4, sticky="we", pady=(8, 0))
+        img_frame.grid_columnconfigure(1, weight=1)
+        img_frame.grid_columnconfigure(3, weight=1)
+
+        ttk.Label(img_frame, text="Buy image:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.buy_img_var = tk.StringVar(value="Not selected")
+        self.buy_img_label = ttk.Label(img_frame, textvariable=self.buy_img_var)
+        self.buy_img_label.grid(row=0, column=1, sticky="we")
+        ttk.Button(img_frame, text="Choose...", command=self.choose_buy_image).grid(row=0, column=2, padx=6)
+
+        ttk.Label(img_frame, text="Sell image:").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        self.sell_img_var = tk.StringVar(value="Not selected")
+        self.sell_img_label = ttk.Label(img_frame, textvariable=self.sell_img_var)
+        self.sell_img_label.grid(row=1, column=1, sticky="we", pady=(6, 0))
+        ttk.Button(img_frame, text="Choose...", command=self.choose_sell_image).grid(row=1, column=2, padx=6, pady=(6, 0))
+
+        # Schedule
+        schedule_frame = ttk.LabelFrame(self.root, text="Schedule (HH:MM B/S, one per line)", padding=8)
+        schedule_frame.pack(fill="both", expand=True, padx=12, pady=8)
+
+        self.schedule_text = tk.Text(schedule_frame, height=12, wrap="none", font=("Consolas", 11))
+        self.schedule_text.pack(fill="both", expand=True)
+        self.schedule_text.insert("1.0", "01:00 S\n01:05 B\n01:10 B\n01:15 S\n01:20 S\n01:25 B\n01:30 S\n01:35 S\n")
+
+        # Controls
+        controls = ttk.Frame(self.root, padding=10)
+        controls.pack(fill="x", padx=12, pady=(0, 8))
+        self.start_btn = ttk.Button(controls, text="Start", command=self.on_start)
+        self.start_btn.pack(side="left")
+        self.stop_btn = ttk.Button(controls, text="Stop", command=self.on_stop, state="disabled")
+        self.stop_btn.pack(side="left", padx=(8, 0))
+
+        # Log
+        log_frame = ttk.LabelFrame(self.root, text="Log", padding=8)
+        log_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.log_text = tk.Text(log_frame, height=10, wrap="word", state="disabled", font=("Consolas", 10))
+        self.log_text.pack(fill="both", expand=True)
+
+    # ---------- UI Handlers ----------
+
+    def choose_buy_image(self):
+        path = filedialog.askopenfilename(
+            title="Choose Buy image",
+            filetypes=[("Image files", "*.png;*.jpg;*.jpeg;*.bmp;*.gif"), ("All files", "*.*")]
+        )
+        if path:
+            self.buy_image_path = path
+            self.buy_img_var.set(os.path.basename(path))
+
+    def choose_sell_image(self):
+        path = filedialog.askopenfilename(
+            title="Choose Sell image",
+            filetypes=[("Image files", "*.png;*.jpg;*.jpeg;*.bmp;*.gif"), ("All files", "*.*")]
+        )
+        if path:
+            self.sell_image_path = path
+            self.sell_img_var.set(os.path.basename(path))
+
+    def log(self, message: str):
+        ts = self.time_provider.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {message}\n"
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", line)
+        # Trim log
+        lines = int(self.log_text.index("end-1c").split(".")[0])
+        if lines > LOG_MAX_LINES:
+            self.log_text.delete("1.0", f"{lines-LOG_MAX_LINES}.0")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _start_clock_updater(self):
+        def tick():
+            try:
+                now = self.time_provider.now()
+                self.clock_var.set(now.strftime("Sri Lanka Time: %Y-%m-%d %H:%M:%S"))
+            finally:
+                self.root.after(500, tick)
+        tick()
+
+    # ---------- Start/Stop ----------
+
+    def on_start(self):
+        url = self.url_var.get().strip()
+        if not url:
+            messagebox.showwarning("Missing URL", "Please enter a URL.")
+            return
+        if not self.buy_image_path or not self.sell_image_path:
+            messagebox.showwarning("Missing Images", "Please select both Buy and Sell images.")
+            return
+        try:
+            interval_min = int(self.interval_var.get() or "0")
+            if interval_min < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("Invalid Interval", "Interval lockout must be a non-negative integer (minutes).")
+            return
+
+        schedule_text = self.schedule_text.get("1.0", "end")
+        schedule = parse_schedule(schedule_text)
+        if not schedule:
+            messagebox.showwarning("Invalid Schedule", "Please provide at least one valid schedule line (HH:MM B/S).")
+            return
+
+        # Disable start, enable stop
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.stop_event.clear()
+        self.last_trade_at = None
+
+        self.worker_thread = threading.Thread(
+            target=self.worker_main,
+            args=(url, schedule, interval_min),
+            daemon=True
+        )
+        self.worker_thread.start()
+
+    def on_stop(self):
+        self.stop_event.set()
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.log("Stopped by user.")
+
+    # ---------- Worker Thread ----------
+
+    def worker_main(self, url: str, schedule: List[Tuple[int, int, str]], interval_min: int):
+        def log(msg: str):
+            self.root.after(0, self.log, msg)
+
+        # Ensure internet time available
+        log("Connecting to internet time service...")
+        while not self.stop_event.is_set():
+            try:
+                self.time_provider.sync()
+                break
+            except Exception as e:
+                log(f"Time sync failed: {e}. Retrying in 3s...")
+                time.sleep(3)
+
+        if self.stop_event.is_set():
+            return
+
+        # Open URL in default browser
+        log(f"Opening URL: {url}")
+        try:
+            webbrowser.open(url, new=1, autoraise=True)
+        except Exception as e:
+            log(f"Failed to open browser: {e}")
+
+        # Identify Buy/Sell buttons
+        log("Waiting for BUY and SELL buttons to appear on screen...")
+        try:
+            buy_center, sell_center = wait_for_images(self.buy_image_path, self.sell_image_path, log, self.stop_event)
+            log("Both buttons identified.")
+        except Exception as e:
+            log(f"Error identifying buttons: {e}")
+            self.root.after(0, self.on_stop)
+            return
+
+        # Main loop
+        next_signal_dt, next_side = find_next_signal(self.time_provider.now(), schedule)
+        log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side}")
+
+        while not self.stop_event.is_set():
+            now = self.time_provider.now()
+
+            # Interval lockout check
+            if self.last_trade_at and interval_min > 0:
+                until = self.last_trade_at + timedelta(minutes=interval_min)
+                if now < until:
+                    # Still in lockout; skip signals that occur during lockout
+                    # But we continue to advance next_signal_dt as time passes
+                    pass
+
+            # Advance next_signal if it's in the past (missed) by >= 10s or we are beyond it
+            # If we are before it, we can sleep a bit
+            if now < next_signal_dt:
+                time.sleep(0.2)
+                continue
+
+            # We are at or after the scheduled minute
+            delta_sec = (now - next_signal_dt).total_seconds()
+
+            if delta_sec < 5:
+                # Wait until we reach +5s window start
+                time.sleep(0.2)
+                continue
+            elif 5 <= delta_sec < 10:
+                # Eligible window to execute, but ensure lockout
+                in_lockout = False
+                if self.last_trade_at and interval_min > 0:
+                    if now < (self.last_trade_at + timedelta(minutes=interval_min)):
+                        in_lockout = True
+
+                if in_lockout:
+                    log(f"In lockout window, skipping signal {next_signal_dt.strftime('%H:%M')} {next_side}")
+                else:
+                    # Re-locate before clicking in case layout moved
+                    try:
+                        if next_side == "B":
+                            box = locate_image_center(self.buy_image_path, CLICK_CONFIDENCE)
+                            center = pyautogui.center(box) if box else None
+                            if center:
+                                x, y = center
+                                pyautogui.moveTo(x, y, duration=0.2)
+                                pyautogui.click(x, y)
+                                self.last_trade_at = now
+                                log(f"Executed BUY at {now.strftime('%H:%M:%S')} (clicked at {center})")
+                            else:
+                                log("BUY button not found at execution time. Skipping.")
+                        else:
+                            box = locate_image_center(self.sell_image_path, CLICK_CONFIDENCE)
+                            center = pyautogui.center(box) if box else None
+                            if center:
+                                x, y = center
+                                pyautogui.moveTo(x, y, duration=0.2)
+                                pyautogui.click(x, y)
+                                self.last_trade_at = now
+                                log(f"Executed SELL at {now.strftime('%H:%M:%S')} (clicked at {center})")
+                            else:
+                                log("SELL button not found at execution time. Skipping.")
+                    except Exception as e:
+                        log(f"Error during click: {e}")
+
+                # Regardless, schedule next signal
+                next_signal_dt, next_side = find_next_signal(now, schedule)
+                log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side}")
+
+            else:
+                # >= 10s late, skip and schedule next
+                log(f"Missed signal {next_signal_dt.strftime('%H:%M')} {next_side} (>{int(delta_sec)}s late). Skipping.")
+                next_signal_dt, next_side = find_next_signal(now, schedule)
+                log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side}")
+
+            time.sleep(0.05)
+
+    # ---------- Run ----------
+
+def main():
+    # Safety: Fail early if pyautogui fails to import display on non-GUI environments
+    try:
+        pyautogui.size()
+    except Exception as e:
+        print("PyAutoGUI not fully functional in this environment:", e, file=sys.stderr)
+
+    root = tk.Tk()
+    app = TradeClickerApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
