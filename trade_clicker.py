@@ -39,6 +39,7 @@ import os
 import sys
 import traceback
 import asyncio
+import asyncio
 
 # Optional global for delayed import (auto-installed on Start)
 pyautogui = None  # type: ignore
@@ -1263,12 +1264,228 @@ class TradeClickerApp:
 
             else:
                 # >= 10s late relative to execution time, skip and schedule the next slot after this signal
-                log(f"Missed execution for signal {next_signal_dt.strftime('%H:%M')} {next_side} (> {int(delta_sec)}s late). Skipping.")
+                log(f"Missed execution for signal {next_signal_dt.strftime('%H:%M')} {next_side} (>{int(delta_sec)}s late). Skipping.")
                 next_signal_dt, next_side = find_next_after(next_signal_dt, schedule)
                 exec_dt = next_signal_dt - timedelta(minutes=1)
                 log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
 
             time.sleep(0.1)
+
+    def worker_session_main(self, url: str, api_id: int, api_hash: str, chats: List[str], buy_kw: str, sell_kw: str, interval_min: int):
+        def log(msg: str):
+            self.root.after(0, self.log, msg)
+
+        # Prepare screen automation backend
+        try:
+            screen = ScreenAutomation(log=log)
+        except Exception as e:
+            log(f"Failed to prepare screen automation backend: {e}")
+            self.root.after(0, self.on_stop)
+            return
+
+        # Ensure internet time available
+        log("Connecting to internet time service...")
+        while not self.stop_event.is_set():
+            try:
+                self.time_provider.sync()
+                break
+            except Exception as e:
+                log(f"Time sync failed: {e}. Retrying in 3s...")
+                time.sleep(3)
+
+        if self.stop_event.is_set():
+            return
+
+        # Open URL in default browser
+        log(f"Opening URL: {url}")
+        try:
+            webbrowser.open(url, new=1, autoraise=True)
+        except Exception as e:
+            log(f"Failed to open browser: {e}")
+
+        # Identify Buy/Sell buttons
+        log("Waiting for BUY and SELL buttons to appear on screen...")
+        try:
+            if not os.path.isfile(self.buy_image_path):
+                raise FileNotFoundError(f"Buy image not found: {self.buy_image_path}")
+            if not os.path.isfile(self.sell_image_path):
+                raise FileNotFoundError(f"Sell image not found: {self.sell_image_path}")
+            if os.path.samefile(self.buy_image_path, self.sell_image_path):
+                raise ValueError("Buy and Sell images are the same file. Please select two different images.")
+            buy_center, sell_center = wait_for_images(screen, self.buy_image_path, self.sell_image_path, log, self.stop_event)
+            log("Both buttons identified.")
+        except Exception as e:
+            tb = traceback.format_exc()
+            log(f"Error identifying buttons: {e!r}\n{tb}")
+            self.root.after(0, self.on_stop)
+            return
+
+        # Setup Telegram client
+        try:
+            telethon = ensure_package("telethon", log=log)
+            from telethon import TelegramClient, events
+            from telethon.errors import SessionPasswordNeededError
+            from telethon.tl.functions.stickers import GetStickerSetRequest
+        except Exception as e:
+            log(f"Failed to prepare Telegram client: {e}")
+            self.root.after(0, self.on_stop)
+            return
+
+        # Prepare or reuse a local session file
+        session_dir = os.path.join(os.path.abspath(os.path.dirname(__file__)), "tg_session")
+        os.makedirs(session_dir, exist_ok=True)
+        session_path = os.path.join(session_dir, "trade_clicker")
+
+        client = TelegramClient(session_path, api_id, api_hash)
+
+        # Interactive auth as needed (GUI prompts)
+        try:
+            client.connect()
+            if not client.is_user_authorized():
+                phone = simpledialog.askstring("Telegram Login", "Enter your phone number (international format):", parent=self.root)
+                if not phone:
+                    log("Telegram login cancelled.")
+                    self.root.after(0, self.on_stop)
+                    return
+                client.send_code_request(phone)
+                code = simpledialog.askstring("Telegram Login", "Enter the login code you received:", parent=self.root)
+                if not code:
+                    log("Telegram login cancelled.")
+                    self.root.after(0, self.on_stop)
+                    return
+                try:
+                    client.sign_in(phone=phone, code=code)
+                except SessionPasswordNeededError:
+                    pwd = simpledialog.askstring("Telegram 2FA", "Your account has a password. Enter your password:", parent=self.root, show="*")
+                    if not pwd:
+                        log("Telegram login cancelled (2FA).")
+                        self.root.after(0, self.on_stop)
+                        return
+                    client.sign_in(password=pwd)
+        except Exception as e:
+            tb = traceback.format_exc()
+            log(f"Telegram authorization failed: {e}\n{tb}")
+            self.root.after(0, self.on_stop)
+            return
+
+        # Normalize keywords
+        buy_kw_low = buy_kw.lower()
+        sell_kw_low = sell_kw.lower()
+
+        # Resolve chat entities if provided
+        target_ids = set()
+        try:
+            if chats:
+                for ch in chats:
+                    try:
+                        entity = client.loop.run_until_complete(client.get_entity(ch))
+                        target_ids.add(getattr(entity, "id", None))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        log("Session trading started. Listening for Telegram signals...")
+
+        # Helper to execute click safely with lockout
+        def execute_side(side: str):
+            now = self.time_provider.now()
+            in_lockout = False
+            if self.last_trade_at and interval_min > 0:
+                if now < (self.last_trade_at + timedelta(minutes=interval_min)):
+                    in_lockout = True
+            if in_lockout:
+                log(f"In lockout window, skipping {('BUY' if side=='B' else 'SELL')} signal")
+                return
+            try:
+                def region_around(cx: int, cy: int, w: int = 160, h: int = 160) -> Tuple[int, int, int, int]:
+                    sw, sh = screen.screen_size()
+                    half_w = max(20, w // 2)
+                    half_h = max(20, h // 2)
+                    left = max(cx - half_w, 0)
+                    top = max(cy - half_h, 0)
+                    right = min(cx + half_w, sw)
+                    bottom = min(cy + half_h, sh)
+                    return (left, top, max(1, right - left), max(1, bottom - top))
+                if side == "B":
+                    rx, ry = buy_center
+                    region = region_around(rx, ry)
+                    box = locate_image_center(screen, self.buy_image_path, CLICK_CONFIDENCE, region=region)
+                    center = screen.center_of(box) if box else buy_center
+                    x, y = center
+                    screen.move_to(x, y, duration=0.2)
+                    screen.click(x, y)
+                    self.last_trade_at = now
+                    log(f"Executed BUY at {now.strftime('%H:%M:%S')} (clicked at {center})")
+                else:
+                    rx, ry = sell_center
+                    region = region_around(rx, ry)
+                    box = locate_image_center(screen, self.sell_image_path, CLICK_CONFIDENCE, region=region)
+                    center = screen.center_of(box) if box else sell_center
+                    x, y = center
+                    screen.move_to(x, y, duration=0.2)
+                    screen.click(x, y)
+                    self.last_trade_at = now
+                    log(f"Executed SELL at {now.strftime('%H:%M:%S')} (clicked at {center})")
+            except Exception as e:
+                log(f"Error during click: {e}")
+
+        # Event handler
+        @client.on(events.NewMessage)
+        async def handler(event):
+            if self.stop_event.is_set():
+                return
+            try:
+                if target_ids:
+                    sender = await event.get_sender()
+                    sid = getattr(sender, "id", None)
+                    if sid not in target_ids:
+                        return
+                text = (event.raw_text or "").strip()
+                # Prefer text/caption keyword match
+                low = text.lower()
+                side = None
+                if buy_kw_low and buy_kw_low in low:
+                    side = "B"
+                elif sell_kw_low and sell_kw_low in low:
+                    side = "S"
+
+                # If no text indicator, attempt to infer from stickers by emoji alt text
+                if side is None and event.message and event.message.sticker:
+                    # Many buy/sell sticker sets include keywords in emoji or set title; do a best-effort
+                    alt = (getattr(event.message.sticker, "alt", "") or "").lower()
+                    set_title = ""
+                    try:
+                        st = await client(GetStickerSetRequest(id=event.message.sticker.set))
+                        set_title = (getattr(st.set, "title", "") or "").lower()
+                    except Exception:
+                        pass
+                    blob = f"{alt} {set_title}".strip()
+                    if buy_kw_low and buy_kw_low in blob:
+                        side = "B"
+                    elif sell_kw_low and sell_kw_low in blob:
+                        side = "S"
+
+                if side:
+                    self.root.after(0, execute_side, side)
+                    log(f"Signal detected from Telegram: {'BUY' if side=='B' else 'SELL'}")
+            except Exception as e:
+                log(f"Telegram handler error: {e}")
+
+        # Run client until stopped
+        try:
+            with client:
+                # Pump the event loop until stop_event is set
+                while not self.stop_event.is_set():
+                    client.loop.run_until_complete(asyncio.sleep(0.2))
+        except Exception as e:
+            log(f"Telegram client error: {e}")
+        finally:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+            self.root.after(0, self.on_stop)
 
     def worker_session_main(self, url: str, api_id: int, api_hash: str, phone: str, chat: str, interval_min: int):
         def log(msg: str):
