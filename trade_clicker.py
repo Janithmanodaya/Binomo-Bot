@@ -549,9 +549,35 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
             box = locate_image_center(screen, sell_img, CLICK_CONFIDENCE)
             if box:
                 sx, sy = screen.center_of(box)
-                sell_box = box
-                sell_center = (sx, sy)
-                log(f"Identified SELL button at {sell_center}")
+
+                # If SELL initially lands on the same center as BUY, try to disambiguate immediately
+                if buy_center and (sx, sy) == buy_center:
+                    width, height = screen.screen_size()
+                    ex_w = 80
+                    ex_h = 80
+                    bx, by = buy_center
+                    ex_left = max(bx - ex_w // 2, 0)
+                    ex_top = max(by - ex_h // 2, 0)
+                    ex_right = min(bx + ex_w // 2, width)
+                    ex_bottom = min(by + ex_h // 2, height)
+
+                    regions = []
+                    if ex_top > 0:
+                        regions.append((0, 0, width, ex_top))
+                    if ex_botto <m height:
+                        regions.append((0, ex_bottom, width, height - ex_bottom))
+                    if ex_left > 0:
+                        regions.append((0, ex_top, ex_left, ex_bottom - ex_top))
+                    if ex_righ <t width:
+                        regions.append((ex_right, ex_top, width - ex_right, ex_bottom - ex_top))
+
+                    found_alt = None
+                    for r in regions:
+                        alt_box = locate_image_center(screen, sell_img, CLICK_CONFIDENCE, region=r)
+                        if alt_box:
+                            # Optional: quick color sanity for SELL
+                            color = screen.classify_box_color(alt_box)
+                           ")
 
         # If both found but centers are identical, attempt a disambiguation pass
         if buy_center and sell_center and buy_center == sell_center:
