@@ -128,6 +128,9 @@ class InternetTimeProvider:
         self._offset = timedelta(0)  # offset to apply to system time to map to Colombo internet time
         self._last_sync = 0.0
         self._tz_fallback = timezone(timedelta(hours=5, minutes=30))
+        # Non-blocking sync control
+        self._syncing = False
+        self._last_attempt = 0.0
 
     # --------- Internet time sources ---------
 
@@ -193,14 +196,31 @@ class InternetTimeProvider:
         self._offset = colombo_now - system_as_colombo
         self._last_sync = time.time()
 
+    def _maybe_start_sync(self):
+        """Start a background sync if due and not already syncing (non-blocking)."""
+        now_ts = time.time()
+        due = (now_ts - self._last_sync) > TIME_RESYNC_SECONDS or self._last_sync == 0.0
+        if due and not self._syncing and (now_ts - self._last_attempt) > 2.0:
+            self._syncing = True
+            self._last_attempt = now_ts
+
+            def _worker():
+                try:
+                    self.sync()
+                except Exception:
+                    # Ignore errors; will try again later
+                    pass
+                finally:
+                    self._syncing = False
+
+            t = threading.Thread(target=_worker, daemon=True)
+            t.start()
+
     def now(self) -> datetime:
-        """Return current virtual Colombo time. Re-sync periodically."""
-        try:
-            if (time.time() - self._last_sync) > TIME_RESYNC_SECONDS or self._last_sync == 0.0:
-                self.sync()
-        except Exception:
-            # If sync fails, keep previous offset and continue ticking locally
-            pass
+        """Return current virtual Colombo time. Start sync in background when due (never blocks)."""
+        # Fire-and-forget sync request if due
+        self._maybe_start_sync()
+
         # Use system time as base, apply offset to emulate Colombo internet time
         system_now_utc = datetime.now(timezone.utc)
         tz = self._tz_fallback
