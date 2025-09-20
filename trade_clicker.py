@@ -119,33 +119,76 @@ def ensure_package(import_name: str, pip_name: Optional[str] = None, log=None):
 # --------------- Utilities ---------------
 
 class InternetTimeProvider:
-    """Provides virtual time for Sri Lanka (Asia/Colombo) using internet, not system time."""
+    """Provides virtual time for Sri Lanka (Asia/Colombo) using internet, not system time.
+    Tries multiple sources and gracefully falls back to last-known offset or fixed +05:30.
+    """
 
     def __init__(self):
         self._offset = timedelta(0)  # offset to apply to system time to map to Colombo internet time
         self._last_sync = 0.0
+        self._tz_fallback = timezone(timedelta(hours=5, minutes=30))
 
-    def _fetch_colombo_time(self) -> datetime:
-        """Fetch current Colombo time from worldtimeapi.org."""
+    # --------- Internet time sources ---------
+
+    def _fetch_worldtimeapi(self) -> datetime:
         req = urllib.request.Request(WORLD_TIME_API, headers={"User-Agent": "trade-clicker/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        # datetime example: "2023-09-20T12:34:56.789012+05:30"
         dt_str = data.get("datetime")
         if not dt_str:
-            raise RuntimeError("Invalid response from time API: missing 'datetime'")
-        # Parse ISO 8601 with timezone
-        # Python fromisoformat supports "+05:30"
-        dt = datetime.fromisoformat(dt_str)
+            raise RuntimeError("worldtimeapi: missing 'datetime'")
+        return datetime.fromisoformat(dt_str)  # tz-aware
+
+    def _fetch_timeapi_io(self) -> datetime:
+        # Example: https://timeapi.io/api/Time/current/zone?timeZone=Asia/Colombo
+        url = "https://timeapi.io/api/Time/current/zone?timeZone=Asia/Colombo"
+        req = urllib.request.Request(url, headers={"User-Agent": "trade-clicker/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        # They provide "dateTime" like "2023-09-20T12:34:56.0000000"
+        # and "timeZone" and "currentLocalTime"
+        dt_str = data.get("dateTime") or data.get("currentLocalTime") or data.get("dateTimeISO")
+        if not dt_str:
+            raise RuntimeError("timeapi.io: missing 'dateTime'")
+        # Returned string may be naive; attach Colombo tz
+        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=self._tz_fallback)
+        return dt.astimezone(self._tz_fallback)
+
+    def _fetch_from_date_header(self) -> datetime:
+        # Use Date header from Google (UTC), then convert to Colombo TZ
+        url = "https://www.google.com/generate_204"
+        req = urllib.request.Request(url, headers={"User-Agent": "trade-clicker/1.0"}, method="HEAD")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            date_hdr = resp.headers.get("Date")
+        if not date_hdr:
+            raise RuntimeError("google: missing Date header")
+        # Parse RFC 7231 date, e.g., "Tue, 15 Nov 1994 08:12:31 GMT"
+        dt = datetime.strptime(date_hdr, "%a, %d %b %Y %H:%M:%S GMT")
+        dt = dt.replace(tzinfo=timezone.utc).astimezone(self._tz_fallback)
         return dt
+
+    def _fetch_colombo_time(self) -> datetime:
+        """Fetch current Colombo time using multiple providers."""
+        errors = []
+        for fetcher in (self._fetch_worldtimeapi, self._fetch_timeapi_io, self._fetch_from_date_header):
+            try:
+                return fetcher()
+            except Exception as e:
+                errors.append(str(e))
+                continue
+        raise RuntimeError("All time sources failed: " + " | ".join(errors))
+
+    # --------- Public API ---------
 
     def sync(self):
         """Sync offset between system time and true Colombo time."""
         colombo_now = self._fetch_colombo_time()
         system_now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
-        # Convert system UTC to Colombo time using API's tzinfo offset
-        colombo_offset = colombo_now.utcoffset() or timedelta(hours=5, minutes=30)
-        system_as_colombo = system_now_utc.astimezone(timezone(colombo_offset))
+        # Use detected offset if available; otherwise fallback +05:30
+        tz = colombo_now.tzinfo or self._tz_fallback
+        system_as_colombo = system_now_utc.astimezone(tz)
         self._offset = colombo_now - system_as_colombo
         self._last_sync = time.time()
 
@@ -159,8 +202,7 @@ class InternetTimeProvider:
             pass
         # Use system time as base, apply offset to emulate Colombo internet time
         system_now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
-        # Use the last known Colombo offset to get tzinfo, default +05:30
-        tz = timezone(timedelta(hours=5, minutes=30))
+        tz = self._tz_fallback
         system_as_colombo = system_now_utc.astimezone(tz)
         return system_as_colombo + self._offset
 
