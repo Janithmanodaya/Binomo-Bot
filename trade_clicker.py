@@ -1158,13 +1158,12 @@ class TradeClickerApp:
             # We are at or after the execution minute (signal time minus one minute)
             delta_sec = (now - exec_dt).total_seconds()
 
-            if delay_secs <= delta_se <  (delay_secs + 5):
+            if delay_secs <= delta_sec < (delay_secs + 5):
                 # Eligible window to execute within the configured 5-second window, but ensure lockout
                 in_lockout = False
                 if self.last_trade_at and interval_min > 0:
-                    if no <a (self.last_trade_at + timedelta(minutes=interval_min)):
-                        in_lockout = _codeTrnewu</e
-e
+                    if now < (self.last_trade_at + timedelta(minutes=interval_min)):
+                        in_lockout = True
 
                 if in_lockout:
                     log(f"In lockout window, skipping signal {next_signal_dt.strftime('%H:%M')} {next_side}")
@@ -1207,15 +1206,15 @@ e
                 # Regardless, schedule next signal strictly after the one we just handled
                 next_signal_dt, next_side = find_next_after(next_signal_dt, schedule)
                 exec_dt = self.compute_execution_time(next_signal_dt, execute_exact)
-                log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')} +{delay_secs}s windo_codew)new"</)
-
+                log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')} +{delay_secs}s window)")
 
             else:
-                # >= (delay+5)s late relative to execution time, skip and schedule the next slot after this signal
-                log(f"Missed execution for signal {next_signal_dt.strftime('%H:%M')} {next_side} (>{int(delta_sec)}s late). Skipping.")
-                next_signal_dt, next_side = find_next_after(next_signal_dt, schedule)
-                exec_dt = self.compute_execution_time(next_signal_dt, execute_exact)
-        log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
+                # If we're too late for the window, skip this signal and move on
+                if delta_sec >= (delay_secs + 5):
+                    log(f"Missed execution for signal {next_signal_dt.strftime('%H:%M')} {next_side} (>{int(delta_sec)}s late). Skipping.")
+                    next_signal_dt, next_side = find_next_after(next_signal_dt, schedule)
+                    exec_dt = self.compute_execution_time(next_signal_dt, execute_exact)
+                    log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')} +{delay_secs}s window)")
 
             time.sleep(0.1)
 
