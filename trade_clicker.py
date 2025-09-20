@@ -546,10 +546,6 @@ def main():
     # Note: pyautogui will be prepared after Start; skip pre-check to allow auto-install.
     root = tk.Tk()
     app = TradeClickerApp(root)
-    root.mainlo_code"PyAutoGUI not fully functional in this environment:", e, file=sys.stderr)
-
-    root = tk.Tk()
-    app = TradeClickerApp(root)
     root.mainloop()
 
 
