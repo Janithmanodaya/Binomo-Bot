@@ -444,7 +444,7 @@ class TradeClickerApp:
 
         # URL input
         ttk.Label(settings, text="URL:").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=4)
-        self.url_var = tk.StringVar()
+        self.url_var = tk.StringVar(value="https://binomo.com/trading")
         self.url_entry = ttk.Entry(settings, textvariable=self.url_var, width=60)
         self.url_entry.grid(row=0, column=1, sticky="we", pady=4)
         settings.grid_columnconfigure(1, weight=1)
