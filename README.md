@@ -18,7 +18,12 @@ Quick start
    python src/run_pipeline.py
 
 Or use the UI (recommended for exploration)
+   # Option A (direct)
    streamlit run src/ui_app.py
+   # Option B (via helper)
+   python run.py --ui
+   # If the browser doesn't open automatically, go to:
+   # http://localhost:8501
 
 Common options (examples)
 - Change symbol:
@@ -40,7 +45,7 @@ What this baseline does
 - Fetches historical 1m OHLCV (UTC) and stores a cleaned parquet in data/raw/.
 - Computes features at time t using only information available up to t (no lookahead).
 - Creates labels using a return threshold tau that approximates roundtrip costs:
-    tau = 2 * (taker_fee_bps + slippage_bps) / 10000
+    tau = 2 * (taker-fee-bps + slippage-bps) / 10000
   Label UP if next_return > +tau, DOWN if next_return < -tau, else NEUTRAL (dropped from training).
 - Trains LightGBM on expanding windows, validates on out-of-sample rolling segments, and tunes the decision probability threshold on each validation fold to maximize realized PnL after costs.
 
@@ -50,6 +55,17 @@ UI features
 - Charts: cumulative PnL over time, trades per day.
 - Per-fold summary table and download button for predictions.csv.
 - If predictions already exist, the UI can visualize them without rerunning.
+
+Troubleshooting the UI (Windows)
+- Activate your venv first:
+   .\\venv\\Scripts\\activate
+- Ensure Streamlit is installed:
+   pip show streamlit
+- Launch specifically on a port (if 8501 is busy):
+   streamlit run src/ui_app.py --server.port 8502
+- If you see import errors for src.run_pipeline, run from the project root:
+   cd path\\to\\project
+   streamlit run src\\ui_app.py
 
 Outputs
 - data/processed/predictions.csv: per-minute predictions, signals, and realized PnL for each fold.

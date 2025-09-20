@@ -6,7 +6,16 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 
-from src.run_pipeline import CostModel, run_pipeline
+# Ensure project root is on sys.path so `from src...` works when running as a script inside src/
+try:
+    from src.run_pipeline import CostModel, run_pipeline  # type: ignore
+except Exception:
+    import sys
+    from pathlib import Path
+    ROOT = Path(__file__).resolve().parents[1]
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from src.run_pipeline import CostModel, run_pipeline  # type: ignore
 
 
 st.set_page_config(page_title="Crypto Baseline Trainer", layout="wide")
