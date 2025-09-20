@@ -13,10 +13,11 @@ Features:
     01:10 B
   The app will:
     * Find the next signal time greater than current time
-    * Execute in a 0–5s window of the configured execution minute:
-        - Exact signal time mode: execute at HH:MM (0–5s window)
-        - Early mode: execute at HH:MM-1 (0–5s window)
-    * If more than 5 seconds late (>= HH:MM:05 of the chosen minute), it skips the trade
+    * Execute in a user-configurable 5-second window within the chosen execution minute:
+        - Exact signal time mode: execute at HH:MM (delay to delay+5 seconds)
+        - Early mode: execute at HH:MM-1 (delay to delay+5 seconds)
+      Example: delay=25 executes within HH:MM:25–HH:MM:30
+    * If more than 5 seconds late (>= delay+5s of the chosen minute), it skips the trade
     * Optional interval lockout (e.g., 15 min) to avoid opening another trade too soon
 
 Notes:
@@ -907,14 +908,21 @@ class TradeClickerApp:
         self.execute_exact_var = tk.BooleanVar(value=False)
         self.execute_exact_check = ttk.Checkbutton(
             settings,
-            text="Exact signal time (0–5s window). If off: place order 1 minute earlier.",
+            text="Exact signal time window. If off: place order 1 minute earlier.",
             variable=self.execute_exact_var
         )
         self.execute_exact_check.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
+        # Delay window selector (seconds)
+        ttk.Label(settings, text="Execution delay (s):").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=(8, 0))
+        self.delay_var = tk.StringVar(value="0")
+        self.delay_entry = ttk.Entry(settings, textvariable=self.delay_var, width=8)
+        self.delay_entry.grid(row=2, column=1, sticky="w", pady=(8, 0))
+        ttk.Label(settings, text="(executes from delay to delay+5s within the chosen minute)").grid(row=2, column=2, columnspan=2, sticky="w", pady=(8, 0))
+
         # Image selectors
         img_frame = ttk.Frame(settings)
-        img_frame.grid(row=2, column=0, columnspan=4, sticky="we", pady=(8_code, new0</))0))
+        img_frame.grid(row=3, column=0, columnspan=4, sticky="we", pady=(8, 0))
         img_frame.grid_columnconfigure(1, weight=1)
         img_frame.grid_columnconfigure(3, weight=1)
 
@@ -1039,9 +1047,23 @@ class TradeClickerApp:
         self.stop_event.clear()
         self.last_trade_at = None
 
+        execute_exact = bool(self.execute_exact_var.get())
+
+        # Parse delay seconds (0-55)
+        try:
+            delay_secs = int(self.delay_var.get() or "0")
+            if not (0 <= delay_secs <= 55):
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("Invalid Delay", "Execution delay must be an integer between 0 and 55 seconds.")
+            # Re-enable Start and disable Stop back since we won't start worker
+            self.start_btn.configure(state="normal")
+            self.stop_btn.configure(state="disabled")
+            return
+
         self.worker_thread = threading.Thread(
             target=self.worker_main,
-            args=(url, schedule, interval_min),
+            args=(url, schedule, interval_min, execute_exact, delay_secs),
             daemon=True
         )
         self.worker_thread.start()
@@ -1054,7 +1076,11 @@ class TradeClickerApp:
 
     # ---------- Worker Thread ----------
 
-    def worker_main(self, url: str, schedule: List[Tuple[int, int, str]], interval_min: int):
+    def compute_execution_time(self, signal_dt: datetime, exact: bool) -> datetime:
+        """Return the execution datetime for a given signal based on the chosen mode."""
+        return signal_dt if exact else (signal_dt - timedelta(minutes=1))
+
+    def worker_main(self, url: str, schedule: List[Tuple[int, int, str]], interval_min: int, execute_exact: bool, delay_secs: int):
         def log(msg: str):
             self.root.after(0, self.log, msg)
 
@@ -1108,8 +1134,9 @@ class TradeClickerApp:
 
         # Main loop
         next_signal_dt, next_side = find_next_signal(self.time_provider.now(), schedule)
-        exec_dt = next_signal_dt - timedelta(minutes=1)
-        log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
+        exec_dt = self.compute_execution_time(next_signal_dt, execute_exact)
+        log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')} +{delay_secs}s window)")
+
 
         while not self.stop_event.is_set():
             now = self.time_provider.now()
@@ -1178,14 +1205,15 @@ class TradeClickerApp:
 
                 # Regardless, schedule next signal strictly after the one we just handled
                 next_signal_dt, next_side = find_next_after(next_signal_dt, schedule)
-                exec_dt = next_signal_dt - timedelta(minutes=1)
-                log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
+                exec_dt = self.compute_execution_time(next_signal_dt, execute_exact)
+                log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')} +{delay_secs}s windo_codew)new"</)
+
 
             else:
                 # >= 5s late relative to execution time, skip and schedule the next slot after this signal
                 log(f"Missed execution for signal {next_signal_dt.strftime('%H:%M')} {next_side} (>{int(delta_sec)}s late). Skipping.")
                 next_signal_dt, next_side = find_next_after(next_signal_dt, schedule)
-                exec_dt = next_signal_dt - timedelta(minutes=1)
+                exec_dt = self.compute_execution_time(next_signal_dt, execute_exact)
                 log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
 
             time.sleep(0.1)
