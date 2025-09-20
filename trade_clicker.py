@@ -13,8 +13,8 @@ Features:
     01:10 B
   The app will:
     * Find the next signal time greater than current time
-    * Wait until that time, then wait 5 seconds and click the correct image/button
-    * If the signal is more than 10 seconds late (>= HH:MM:10), it skips the trade
+    * Execute at the start of the signal minute (0–5s window) and click the correct image/button
+    * If the signal is more than 5 seconds late (>= HH:MM:05), it skips the trade
     * Optional interval lockout (e.g., 15 min) to avoid opening another trade too soon
 
 Notes:
@@ -1111,24 +1111,20 @@ class TradeClickerApp:
                     # But we continue to advance next_signal_dt as time passes
                     pass
 
-            # Advance next execution if it's in the past (missed) by >= 10s or we are beyond it
+            # Advance next execution if it's in the past (missed) by >= 5s or we are beyond it
             # If we are before it, we can sleep a bit
-            if now < exec_dt:
+            if now &lt; exec_dt:
                 time.sleep(0.2)
                 continue
 
             # We are at or after the execution minute (signal time minus one minute)
             delta_sec = (now - exec_dt).total_seconds()
 
-            if delta_sec < 5:
-                # Wait until we reach +5s window start
-                time.sleep(0.2)
-                continue
-            elif 5 <= delta_sec < 10:
-                # Eligible window to execute, but ensure lockout
+            if 0 &lt;= delta_sec &lt; 5:
+                # Eligible window to execute immediately at the start of the signal minute (0-5s), but ensure lockout
                 in_lockout = False
-                if self.last_trade_at and interval_min > 0:
-                    if now < (self.last_trade_at + timedelta(minutes=interval_min)):
+                if self.last_trade_at and interval_min &gt; 0:
+                    if now &lt; (self.last_trade_at + timedelta(minutes=interval_min)):
                         in_lockout = True
 
                 if in_lockout:
@@ -1136,7 +1132,7 @@ class TradeClickerApp:
                 else:
                     # Re-locate within a small region around the pre-identified centers to avoid cross-matching.
                     try:
-                        def region_around(cx: int, cy: int, w: int = 160, h: int = 160) -> Tuple[int, int, int, int]:
+                        def region_around(cx: int, cy: int, w: int = 160, h: int = 160) -&gt; Tuple[int, int, int, int]:
                             sw, sh = screen.screen_size()
                             half_w = max(20, w // 2)
                             half_h = max(20, h // 2)
@@ -1175,8 +1171,8 @@ class TradeClickerApp:
                 log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
 
             else:
-                # >= 10s late relative to execution time, skip and schedule the next slot after this signal
-                log(f"Missed execution for signal {next_signal_dt.strftime('%H:%M')} {next_side} (>{int(delta_sec)}s late). Skipping.")
+                # &gt;= 5s late relative to execution time, skip and schedule the next slot after this signal
+                log(f"Missed execution for signal {next_signal_dt.strftime('%H:%M')} {next_side} (&gt;{int(delta_sec)}s late). Skipping.")
                 next_signal_dt, next_side = find_next_after(next_signal_dt, schedule)
                 exec_dt = next_signal_dt - timedelta(minutes=1)
                 log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
