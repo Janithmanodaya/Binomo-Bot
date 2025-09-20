@@ -45,11 +45,13 @@ pyautogui = None  # type: ignore
 # --------------- Configuration ---------------
 
 WORLD_TIME_API = "http://worldtimeapi.org/api/timezone/Asia/Colombo"
-TIME_RESYNC_SECONDS = 30  # periodically re-sync virtual time from internet
-IMAGE_SEARCH_INTERVAL = 1.5  # seconds between image search attempts
+TIME_RESYNC_SECONDS = 3600  # re-sync virtual time from internet roughly once per hour
+IMAGE_SEARCH_INTERVAL = 2.0  # seconds between image search attempts (lower CPU usage)
 IMAGE_SEARCH_TIMEOUT = 300  # max seconds to wait for locating both buttons (5 minutes)
 CLICK_CONFIDENCE = 0.8  # used if OpenCV is available
 LOG_MAX_LINES = 500
+# Consider adjusting only if drift is meaningful to avoid tiny jitter adjustments
+TIME_DRIFT_THRESHOLD_SECONDS = 1.5
 
 # Auto-install helper
 def ensure_package(import_name: str, pip_name: Optional[str] = None, log=None):
@@ -128,6 +130,9 @@ class InternetTimeProvider:
         self._offset = timedelta(0)  # offset to apply to system time to map to Colombo internet time
         self._last_sync = 0.0
         self._tz_fallback = timezone(timedelta(hours=5, minutes=30))
+        # Non-blocking sync control
+        self._syncing = False
+        self._last_attempt = 0.0
 
     # --------- Internet time sources ---------
 
@@ -186,23 +191,47 @@ class InternetTimeProvider:
     def sync(self):
         """Sync offset between system time and true Colombo time."""
         colombo_now = self._fetch_colombo_time()
-        system_now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+        system_now_utc = datetime.now(timezone.utc)
         # Use detected offset if available; otherwise fallback +05:30
         tz = colombo_now.tzinfo or self._tz_fallback
         system_as_colombo = system_now_utc.astimezone(tz)
-        self._offset = colombo_now - system_as_colombo
+        new_offset = colombo_now - system_as_colombo
+        # Only update if drift is meaningful (avoid tiny jitter)
+        try:
+            drift = abs((new_offset - self._offset).total_seconds())
+        except Exception:
+            drift = TIME_DRIFT_THRESHOLD_SECONDS + 1.0
+        if self._last_sync == 0.0 or drift > TIME_DRIFT_THRESHOLD_SECONDS:
+            self._offset = new_offset
         self._last_sync = time.time()
 
+    def _maybe_start_sync(self):
+        """Start a background sync if due and not already syncing (non-blocking)."""
+        now_ts = time.time()
+        due = (now_ts - self._last_sync) > TIME_RESYNC_SECONDS or self._last_sync == 0.0
+        if due and not self._syncing and (now_ts - self._last_attempt) > 2.0:
+            self._syncing = True
+            self._last_attempt = now_ts
+
+            def _worker():
+                try:
+                    self.sync()
+                except Exception:
+                    # Ignore errors; will try again later
+                    pass
+                finally:
+                    self._syncing = False
+
+            t = threading.Thread(target=_worker, daemon=True)
+            t.start()
+
     def now(self) -> datetime:
-        """Return current virtual Colombo time. Re-sync periodically."""
-        try:
-            if (time.time() - self._last_sync) > TIME_RESYNC_SECONDS or self._last_sync == 0.0:
-                self.sync()
-        except Exception:
-            # If sync fails, keep previous offset and continue ticking locally
-            pass
+        """Return current virtual Colombo time. Start sync in background when due (never blocks)."""
+        # Fire-and-forget sync request if due
+        self._maybe_start_sync()
+
         # Use system time as base, apply offset to emulate Colombo internet time
-        system_now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+        system_now_utc = datetime.now(timezone.utc)
         tz = self._tz_fallback
         system_as_colombo = system_now_utc.astimezone(tz)
         return system_as_colombo + self._offset
@@ -212,6 +241,7 @@ class InternetTimeProvider:
 def parse_schedule(text: str) -> List[Tuple[int, int, str]]:
     """
     Parse schedule lines like "01:10 B" or "23:45 S" (case-insensitive B/S).
+    Also accepts synonyms: BUY/CALL => B, SELL/PUT => S.
 
     Returns: list of tuples (hour, minute, side) where side in {"B", "S"} sorted by time.
     """
@@ -234,10 +264,15 @@ def parse_schedule(text: str) -> List[Tuple[int, int, str]]:
                 continue
         except ValueError:
             continue
-        side = side.upper()
-        if side not in {"B", "S"}:
+        side_up = side.upper()
+        # Map synonyms to canonical B/S
+        if side_up in {"B", "BUY", "CALL"}:
+            canon = "B"
+        elif side_up in {"S", "SELL", "PUT"}:
+            canon = "S"
+        else:
             continue
-        entries.append((h, m, side))
+        entries.append((h, m, canon))
     # Sort by hour, then minute
     entries.sort(key=lambda x: (x[0], x[1]))
     return entries
@@ -259,6 +294,31 @@ def find_next_signal(now_dt: datetime, schedule: List[Tuple[int, int, str]]) -> 
     h, m, side = schedule[0]
     tomorrow = today + timedelta(days=1)
     candidate = datetime(tomorrow.year, tomorrow.month, tomorrow.day, h, m, 0, tzinfo=now_dt.tzinfo)
+    return candidate, side
+
+
+def find_next_after(prev_signal_dt: datetime, schedule: List[Tuple[int, int, str]]) -> Tuple[datetime, str]:
+    """
+    Find the next schedule strictly after the given previous signal datetime (same day or next day).
+    This avoids reusing the same schedule when we operate relative to an execution time (signal-1min).
+    """
+    # Build an ordered list of today's datetimes for the schedule
+    if not schedule:
+        raise ValueError("Schedule is empty.")
+    base_date = prev_signal_dt.date()
+    tz = prev_signal_dt.tzinfo
+    seen_current = False
+    for h, m, side in schedule:
+        candidate = datetime(prev_signal_dt.year, prev_signal_dt.month, prev_signal_dt.day, h, m, 0, tzinfo=tz)
+        if candidate == prev_signal_dt:
+            seen_current = True
+            continue
+        if candidate > prev_signal_dt:
+            return candidate, side
+    # If we reach here, roll to tomorrow and take the first
+    h, m, side = schedule[0]
+    tomorrow = base_date + timedelta(days=1)
+    candidate = datetime(tomorrow.year, tomorrow.month, tomorrow.day, h, m, 0, tzinfo=tz)
     return candidate, side
 
 # --------------- Image Recognition and Clicking ---------------
@@ -318,27 +378,123 @@ class ScreenAutomation:
             self.backend = "fallback"
             self.log("Using fallback backend (pyscreeze + pydirectinput).")
 
-    def locate_on_screen(self, image_path: str, confidence: Optional[float] = None):
+    def screen_size(self) -> Tuple[int, int]:
+        """Return (width, height) of the primary screen."""
+        if self.backend == "pyautogui":
+            try:
+                size = self.pg.size()
+                return int(size[0]), int(size[1])
+            except Exception:
+                pass
+        # fallback using pyscreeze screenshot
+        try:
+            im = self.pyscreeze.screenshot() if self.pyscreeze else self.pg.screenshot()
+            return im.size[0], im.size[1]
+        except Exception:
+            # Conservative default full HD
+            return 1920, 1080
+
+    def locate_on_screen(self, image_path: str, confidence: Optional[float] = None, region: Optional[Tuple[int, int, int, int]] = None):
         # Only pass confidence if cv2 is available
         if not self.has_confidence:
             confidence = None
 
+        # Helper to decide if an exception is the "not found" case
+        def _is_not_found(exc: Exception) -> bool:
+            name = exc.__class__.__name__
+            return name == "ImageNotFoundException"
+
         if self.backend == "pyautogui":
             try:
+                kwargs = {}
                 if confidence is not None:
-                    return self.pg.locateOnScreen(image_path, confidence=confidence)
-                return self.pg.locateOnScreen(image_path)
-            except Exception:
-                # Retry without confidence if backend complains
-                return self.pg.locateOnScreen(image_path)
+                    kwargs["confidence"] = confidence
+                if region is not None:
+                    kwargs["region"] = region
+                # grayscale speeds matching in many cases
+                kwargs["grayscale"] = True
+                return self.pg.locateOnScreen(image_path, **kwargs)
+            except Exception as e:
+                # If it's the "not found" case, return None instead of raising
+                if _is_not_found(e):
+                    return None
+                # Retry once without confidence (in case confidence unsupported), then handle not-found again
+                try:
+                    kwargs.pop("confidence", None)
+                    kwargs["grayscale"] = True
+                    return self.pg.locateOnScreen(image_path, **kwargs)
+                except Exception as e2:
+                    if _is_not_found(e2):
+                        return None
+                    raise
         else:
             # pyscreeze.locateOnScreen supports confidence if OpenCV is available
             try:
+                kwargs = {}
                 if confidence is not None:
-                    return self.pyscreeze.locateOnScreen(image_path, confidence=confidence)
-                return self.pyscreeze.locateOnScreen(image_path)
+                    kwargs["confidence"] = confidence
+                if region is not None:
+                    kwargs["region"] = region
+                kwargs["grayscale"] = True
+                return self.pyscreeze.locateOnScreen(image_path, **kwargs)
+            except Exception as e:
+                if _is_not_found(e):
+                    return None
+                try:
+                    kwargs.pop("confidence", None)
+                    kwargs["grayscale"] = True
+                    return self.pyscreeze.locateOnScreen(image_path, **kwargs)
+                except Exception as e2:
+                    if _is_not_found(e2):
+                        return None
+                    raise
+
+    def locate_all_on_screen(self, image_path: str, confidence: Optional[float] = None, region: Optional[Tuple[int, int, int, int]] = None):
+        """
+        Return an iterator (or list) of all matching boxes on screen. If unsupported, falls back to single locate.
+        """
+        if not self.has_confidence:
+            confidence = None
+
+        def _iter_pg(gen):
+            try:
+                for box in gen:
+                    yield box
             except Exception:
-                return self.pyscreeze.locateOnScreen(image_path)
+                return
+
+        if self.backend == "pyautogui":
+            try:
+                kwargs = {}
+                if confidence is not None:
+                    kwargs["confidence"] = confidence
+                if region is not None:
+                    kwargs["region"] = region
+                kwargs["grayscale"] = True
+                gen = self.pg.locateAllOnScreen(image_path, **kwargs)
+                # Some versions return a generator; normalize to iterator
+                for box in _iter_pg(gen):
+                    yield box
+            except Exception:
+                # Fallback to single locate
+                box = self.locate_on_screen(image_path, confidence=confidence, region=region)
+                if box:
+                    yield box
+        else:
+            try:
+                kwargs = {}
+                if confidence is not None:
+                    kwargs["confidence"] = confidence
+                if region is not None:
+                    kwargs["region"] = region
+                kwargs["grayscale"] = True
+                gen = self.pyscreeze.locateAllOnScreen(image_path, **kwargs)
+                for box in gen:
+                    yield box
+            except Exception:
+                box = self.locate_on_screen(image_path, confidence=confidence, region=region)
+                if box:
+                    yield box
 
     @staticmethod
     def center_of(box):
@@ -363,20 +519,137 @@ class ScreenAutomation:
         else:
             self.direct.click(x=x, y=y)
 
-def locate_image_center(screen: "ScreenAutomation", path: str, confidence: Optional[float] = None) -> Optional[Tuple[int, int, int, int]]:
+    # ---------- Color-aware helpers (used when OpenCV is available) ----------
+
+    def _screenshot_bgr(self):
+        """
+        Return current screen as a NumPy array in BGR order, or None if unavailable.
+        Requires OpenCV (cv2) and NumPy; only used when has_confidence is True.
+        """
+        if not self.has_confidence:
+            return None
+        try:
+            import numpy as np  # cv2 depends on numpy; should be present with cv2
+            from PIL import Image
+        except Exception:
+            return None
+
+        try:
+            pil_img = None
+            if self.backend == "pyautogui" and hasattr(self.pg, "screenshot"):
+                pil_img = self.pg.screenshot()
+            elif self.pyscreeze and hasattr(self.pyscreeze, "screenshot"):
+                pil_img = self.pyscreeze.screenshot()
+            if pil_img is None:
+                return None
+            rgb = np.array(pil_img)  # RGB
+            # Convert to BGR
+            bgr = rgb[:, :, ::-1].copy()
+            return bgr
+        except Exception:
+            return None
+
+    def classify_box_color(self, box) -> str:
+        """
+        Classify the dominant color in the given box as 'green', 'red', or 'other'.
+        Uses HSV thresholds on a screenshot. Returns 'other' if unavailable.
+        Only used when OpenCV is available.
+        """
+        if not self.has_confidence:
+            return "other"
+        try:
+            import cv2
+            import numpy as np
+        except Exception:
+            return "other"
+
+        bgr = self._screenshot_bgr()
+        if bgr is None:
+            return "other"
+
+        left, top, width, height = box
+        h, w = bgr.shape[:2]
+        x1 = max(int(left), 0)
+        y1 = max(int(top), 0)
+        x2 = min(int(left + width), w)
+        y2 = min(int(top + height), h)
+        if x2 <= x1 or y2 <= y1:
+            return "other"
+
+        roi = bgr[y1:y2, x1:x2]
+        if roi.size == 0:
+            return "other"
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+        # Thresholds
+        # Green: H in [35, 85], S and V not too low
+        lower_green = (35, 80, 60)
+        upper_green = (85, 255, 255)
+        mask_green = cv2.inRange(hsv, lower_green, upper_green)
+
+        # Red wraps around: [0,10] and [170,180]
+        lower_red1 = (0, 80, 60)
+        upper_red1 = (10, 255, 255)
+        lower_red2 = (170, 80, 60)
+        upper_red2 = (180, 255, 255)
+        mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        mask_red = cv2.bitwise_or(mask_red1, mask_red2)
+
+        # Compute ratios
+        total = roi.shape[0] * roi.shape[1]
+        if total == 0:
+            return "other"
+        green_ratio = float(np.count_nonzero(mask_green)) / float(total)
+        red_ratio = float(np.count_nonzero(mask_red)) / float(total)
+
+        # Heuristic thresholds
+        if green_ratio >= 0.12 and green_ratio > red_ratio * 1.2:
+            return "green"
+        if red_ratio >= 0.12 and red_ratio > green_ratio * 1.2:
+            return "red"
+        return "other"
+
+def locate_image_center(screen: "ScreenAutomation", path: str, confidence: Optional[float] = None, region: Optional[Tuple[int, int, int, int]] = None) -> Optional[Tuple[int, int, int, int]]:
     """
     Locate image on screen. Returns a Box (left, top, width, height) or None.
     If confidence is provided and OpenCV is available, uses that confidence.
+    Optionally restrict search to a region=(left, top, width, height).
     """
-    return screen.locate_on_screen(path, confidence=confidence)
+    return screen.locate_on_screen(path, confidence=confidence, region=region)
 
 
 def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log, stop_event: threading.Event) -> Tuple[Tuple[int, int], Tuple[int, int]]:
     """
     Wait until both Buy and Sell images are located on the screen.
+    Ensures the two matches are different on-screen locations. If both initially
+    resolve to the same area, retries the second search excluding a small region
+    around the first match. If OpenCV is available, validate color (BUY=green, SELL=red)
+    and discard mismatched color hits to reduce confusion from nearly identical shapes.
     Returns center points for both as ((x,y)_buy, (x,y)_sell).
     """
     start = time.time()
+    last_status_log = 0.0
+
+    def locate_with_fallbacks(img_path: str, region: Optional[Tuple[int, int, int, int]] = None):
+        # Try with progressively lower confidence if OpenCV is available
+        if screen.has_confidence:
+            tried = set()
+            for conf in (CLICK_CONFIDENCE, 0.75, 0.7, 0.65, 0.6):
+                c = max(0.0, min(1.0, conf))
+                if c in tried:
+                    continue
+                tried.add(c)
+                box = locate_image_center(screen, img_path, c, region)
+                if box:
+                    return box
+            return None
+        else:
+            return locate_image_center(screen, img_path, None, region)
+
+    buy_box = None
+    sell_box = None
     buy_center = None
     sell_center = None
 
@@ -384,21 +657,181 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
         if time.time() - start > IMAGE_SEARCH_TIMEOUT:
             raise TimeoutError("Timed out waiting for Buy/Sell buttons on screen.")
 
+        # Try find BUY if missing
         if buy_center is None:
-            box = locate_image_center(screen, buy_img, CLICK_CONFIDENCE)
-            if box:
-                bx, by = screen.center_of(box)
+            # If OpenCV present, scan all matches and prefer those that look green
+            best_box = None
+            if screen.has_confidence:
+                for cand in screen.locate_all_on_screen(buy_img, confidence=CLICK_CONFIDENCE):
+                    color = screen.classify_box_color(cand)
+                    if color == "green":
+                        best_box = cand
+                        break
+                    if best_box is None:
+                        best_box = cand
+            else:
+                best_box = locate_with_fallbacks(buy_img)
+
+            if best_box:
+                bx, by = screen.center_of(best_box)
+                buy_box = best_box
                 buy_center = (bx, by)
                 log(f"Identified BUY button at {buy_center}")
+
+        # Try find SELL if missing
         if sell_center is None:
-            box = locate_image_center(screen, sell_img, CLICK_CONFIDENCE)
-            if box:
-                sx, sy = screen.center_of(box)
+            # If OpenCV present, scan all matches and prefer those that look red
+            best_box = None
+            if screen.has_confidence:
+                for cand in screen.locate_all_on_screen(sell_img, confidence=CLICK_CONFIDENCE):
+                    color = screen.classify_box_color(cand)
+                    if color == "red":
+                        best_box = cand
+                        break
+                    if best_box is None:
+                        best_box = cand
+            else:
+                best_box = locate_with_fallbacks(sell_img)
+
+            if best_box:
+                sx, sy = screen.center_of(best_box)
+
+                # If SELL initially lands on the same center as BUY, try to disambiguate immediately
+                if buy_center and (sx, sy) == buy_center:
+                    width, height = screen.screen_size()
+                    ex_w = 80
+                    ex_h = 80
+                    bx, by = buy_center
+                    ex_left = max(bx - ex_w // 2, 0)
+                    ex_top = max(by - ex_h // 2, 0)
+                    ex_right = min(bx + ex_w // 2, width)
+                    ex_bottom = min(by + ex_h // 2, height)
+
+                    regions = []
+                    if ex_top > 0:
+                        regions.append((0, 0, width, ex_top))
+                    if ex_bottom < height:
+                        regions.append((0, ex_bottom, width, height - ex_bottom))
+                    if ex_left > 0:
+                        regions.append((0, ex_top, ex_left, ex_bottom - ex_top))
+                    if ex_right < width:
+                        regions.append((ex_right, ex_top, width - ex_right, ex_bottom - ex_top))
+
+                    found_alt = None
+                    for r in regions:
+                        # Prefer red candidates in alternate regions
+                        alt_best = None
+                        if screen.has_confidence:
+                            for cand in screen.locate_all_on_screen(sell_img, confidence=CLICK_CONFIDENCE, region=r):
+                                color = screen.classify_box_color(cand)
+                                if color == "red":
+                                    alt_best = cand
+                                    break
+                                if alt_best is None:
+                                    alt_best = cand
+                        else:
+                            alt_best = locate_with_fallbacks(sell_img, region=r)
+
+                        if alt_best:
+                            color = screen.classify_box_color(alt_best)
+                            if color == "green":
+                                continue
+                            found_alt = alt_best
+                            break
+
+                    if found_alt:
+                        sx, sy = screen.center_of(found_alt)
+                        sell_box = found_alt
+                        sell_center = (sx, sy)
+                        log(f"Adjusted SELL match to {sell_center}")
+                    else:
+                        # Don't log the overlapping SELL; wait and try again next iteration
+                        sell_center = None
+                        sell_box = None
+                else:
+                    sell_box = best_box
+                    sell_center = (sx, sy)
+                    log(f"Identified SELL button at {sell_center}")
+
+        # If both found but centers are identical, attempt a disambiguation pass
+        if buy_center and sell_center and buy_center == sell_center:
+            # Exclude a small rectangle around the first (BUY) and re-search SELL
+            width, height = screen.screen_size()
+            # Exclusion margin around the first center
+            ex_w = 80
+            ex_h = 80
+            bx, by = buy_center
+            ex_left = max(bx - ex_w // 2, 0)
+            ex_top = max(by - ex_h // 2, 0)
+            ex_right = min(bx + ex_w // 2, width)
+            ex_bottom = min(by + ex_h // 2, height)
+
+            # Build up to 4 regions around the exclusion zone
+            regions = []
+            # Top region
+            if ex_top > 0:
+                regions.append((0, 0, width, ex_top))
+            # Bottom region
+            if ex_bottom < height:
+                regions.append((0, ex_bottom, width, height - ex_bottom))
+            # Left region
+            if ex_left > 0:
+                regions.append((0, ex_top, ex_left, ex_bottom - ex_top))
+            # Right region
+            if ex_right < width:
+                regions.append((ex_right, ex_top, width - ex_right, ex_bottom - ex_top))
+
+            found_alt = None
+            for r in regions:
+                alt_box = locate_with_fallbacks(sell_img, region=r)
+                if alt_box:
+                    # Validate color for SELL
+                    color = screen.classify_box_color(alt_box)
+                    if color == "green":
+                        continue
+                    found_alt = alt_box
+                    break
+
+            if found_alt:
+                sx, sy = screen.center_of(found_alt)
+                sell_box = found_alt
                 sell_center = (sx, sy)
-                log(f"Identified SELL button at {sell_center}")
+                log(f"Adjusted SELL match to {sell_center}")
+            else:
+                # Could not disambiguate now; clear SELL and retry in next loop
+                sell_center = None
+                sell_box = None
+
+        # If both found, as a final color sanity check (when available), correct or swap if needed
+        if buy_center and sell_center and screen.has_confidence:
+            buy_color = screen.classify_box_color(buy_box)
+            sell_color = screen.classify_box_color(sell_box)
+            if buy_color == "red" and sell_color == "green":
+                # Likely swapped; swap the assignments
+                buy_center, sell_center = sell_center, buy_center
+                buy_box, sell_box = sell_box, buy_box
+                log("Swapped BUY/SELL matches based on color validation.")
+            elif buy_color == "red":
+                # Discard BUY and retry
+                buy_center, buy_box = None, None
+            elif sell_color == "green":
+                # Discard SELL and retry
+                sell_center, sell_box = None, None
 
         if buy_center and sell_center:
             return buy_center, sell_center
+
+        # Periodic status logs so the user sees progress
+        now_ts = time.time()
+        if now_ts - last_status_log > 2.0:
+            missing = []
+            if buy_center is None:
+                missing.append("BUY")
+            if sell_center is None:
+                missing.append("SELL")
+            if missing:
+                log(f"Still searching for: {', '.join(missing)}...")
+            last_status_log = now_ts
 
         time.sleep(IMAGE_SEARCH_INTERVAL)
 
@@ -421,6 +854,10 @@ class TradeClickerApp:
         self.worker_thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
         self.last_trade_at: Optional[datetime] = None
+
+        # Per-button click offsets (dx, dy) applied to detected center when clicking
+        self.buy_click_offset: Tuple[int, int] = (0, 0)
+        self.sell_click_offset: Tuple[int, int] = (0, 0)
 
         # UI
         self._build_ui()
@@ -563,6 +1000,22 @@ class TradeClickerApp:
             messagebox.showwarning("Invalid Interval", "Interval lockout must be a non-negative integer (minutes).")
             return
 
+        # Parse click offsets (tolerate older UI without offset fields)
+        if hasattr(self, "buy_dx_var") and hasattr(self, "buy_dy_var") and hasattr(self, "sell_dx_var") and hasattr(self, "sell_dy_var"):
+            try:
+                bdx = int(self.buy_dx_var.get() or "0")
+                bdy = int(self.buy_dy_var.get() or "0")
+                sdx = int(self.sell_dx_var.get() or "0")
+                sdy = int(self.sell_dy_var.get() or "0")
+            except ValueError:
+                messagebox.showwarning("Invalid Offsets", "Offsets must be integers (pixels).")
+                return
+        else:
+            bdx = bdy = sdx = sdy = 0
+
+        self.buy_click_offset = (bdx, bdy)
+        self.sell_click_offset = (sdx, sdy)
+
         schedule_text = self.schedule_text.get("1.0", "end")
         schedule = parse_schedule(schedule_text)
         if not schedule:
@@ -630,6 +1083,9 @@ class TradeClickerApp:
                 raise FileNotFoundError(f"Buy image not found: {self.buy_image_path}")
             if not os.path.isfile(self.sell_image_path):
                 raise FileNotFoundError(f"Sell image not found: {self.sell_image_path}")
+            # Prevent using the same file for both buttons
+            if os.path.samefile(self.buy_image_path, self.sell_image_path):
+                raise ValueError("Buy and Sell images are the same file. Please select two different images.")
 
             buy_center, sell_center = wait_for_images(screen, self.buy_image_path, self.sell_image_path, log, self.stop_event)
             log("Both buttons identified.")
@@ -641,7 +1097,8 @@ class TradeClickerApp:
 
         # Main loop
         next_signal_dt, next_side = find_next_signal(self.time_provider.now(), schedule)
-        log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side}")
+        exec_dt = next_signal_dt - timedelta(minutes=1)
+        log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
 
         while not self.stop_event.is_set():
             now = self.time_provider.now()
@@ -654,14 +1111,14 @@ class TradeClickerApp:
                     # But we continue to advance next_signal_dt as time passes
                     pass
 
-            # Advance next_signal if it's in the past (missed) by >= 10s or we are beyond it
+            # Advance next execution if it's in the past (missed) by >= 10s or we are beyond it
             # If we are before it, we can sleep a bit
-            if now < next_signal_dt:
+            if now < exec_dt:
                 time.sleep(0.2)
                 continue
 
-            # We are at or after the scheduled minute
-            delta_sec = (now - next_signal_dt).total_seconds()
+            # We are at or after the execution minute (signal time minus one minute)
+            delta_sec = (now - exec_dt).total_seconds()
 
             if delta_sec < 5:
                 # Wait until we reach +5s window start
@@ -677,44 +1134,54 @@ class TradeClickerApp:
                 if in_lockout:
                     log(f"In lockout window, skipping signal {next_signal_dt.strftime('%H:%M')} {next_side}")
                 else:
-                    # Re-locate before clicking in case layout moved
+                    # Re-locate within a small region around the pre-identified centers to avoid cross-matching.
                     try:
+                        def region_around(cx: int, cy: int, w: int = 160, h: int = 160) -> Tuple[int, int, int, int]:
+                            sw, sh = screen.screen_size()
+                            half_w = max(20, w // 2)
+                            half_h = max(20, h // 2)
+                            left = max(cx - half_w, 0)
+                            top = max(cy - half_h, 0)
+                            right = min(cx + half_w, sw)
+                            bottom = min(cy + half_h, sh)
+                            return (left, top, max(1, right - left), max(1, bottom - top))
+
                         if next_side == "B":
-                            box = locate_image_center(screen, self.buy_image_path, CLICK_CONFIDENCE)
-                            center = screen.center_of(box) if box else None
-                            if center:
-                                x, y = center
-                                screen.move_to(x, y, duration=0.2)
-                                screen.click(x, y)
-                                self.last_trade_at = now
-                                log(f"Executed BUY at {now.strftime('%H:%M:%S')} (clicked at {center})")
-                            else:
-                                log("BUY button not found at execution time. Skipping.")
+                            rx, ry = buy_center
+                            region = region_around(rx, ry)
+                            box = locate_image_center(screen, self.buy_image_path, CLICK_CONFIDENCE, region=region)
+                            center = screen.center_of(box) if box else buy_center  # fallback to stored center
+                            x, y = center
+                            screen.move_to(x, y, duration=0.2)
+                            screen.click(x, y)
+                            self.last_trade_at = now
+                            log(f"Executed BUY at {now.strftime('%H:%M:%S')} (clicked at {center})")
                         else:
-                            box = locate_image_center(screen, self.sell_image_path, CLICK_CONFIDENCE)
-                            center = screen.center_of(box) if box else None
-                            if center:
-                                x, y = center
-                                screen.move_to(x, y, duration=0.2)
-                                screen.click(x, y)
-                                self.last_trade_at = now
-                                log(f"Executed SELL at {now.strftime('%H:%M:%S')} (clicked at {center})")
-                            else:
-                                log("SELL button not found at execution time. Skipping.")
+                            rx, ry = sell_center
+                            region = region_around(rx, ry)
+                            box = locate_image_center(screen, self.sell_image_path, CLICK_CONFIDENCE, region=region)
+                            center = screen.center_of(box) if box else sell_center  # fallback to stored center
+                            x, y = center
+                            screen.move_to(x, y, duration=0.2)
+                            screen.click(x, y)
+                            self.last_trade_at = now
+                            log(f"Executed SELL at {now.strftime('%H:%M:%S')} (clicked at {center})")
                     except Exception as e:
                         log(f"Error during click: {e}")
 
-                # Regardless, schedule next signal
-                next_signal_dt, next_side = find_next_signal(now, schedule)
-                log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side}")
+                # Regardless, schedule next signal strictly after the one we just handled
+                next_signal_dt, next_side = find_next_after(next_signal_dt, schedule)
+                exec_dt = next_signal_dt - timedelta(minutes=1)
+                log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
 
             else:
-                # >= 10s late, skip and schedule next
-                log(f"Missed signal {next_signal_dt.strftime('%H:%M')} {next_side} (>{int(delta_sec)}s late). Skipping.")
-                next_signal_dt, next_side = find_next_signal(now, schedule)
-                log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side}")
+                # >= 10s late relative to execution time, skip and schedule the next slot after this signal
+                log(f"Missed execution for signal {next_signal_dt.strftime('%H:%M')} {next_side} (>{int(delta_sec)}s late). Skipping.")
+                next_signal_dt, next_side = find_next_after(next_signal_dt, schedule)
+                exec_dt = next_signal_dt - timedelta(minutes=1)
+                log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
 
-            time.sleep(0.05)
+            time.sleep(0.1)
 
     # ---------- Run ----------
 
