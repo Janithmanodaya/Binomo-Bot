@@ -37,6 +37,7 @@ import importlib
 import subprocess
 import os
 import sys
+import traceback
 
 # Optional global for delayed import (auto-installed on Start)
 pyautogui = None  # type: ignore
@@ -624,10 +625,17 @@ class TradeClickerApp:
         # Identify Buy/Sell buttons
         log("Waiting for BUY and SELL buttons to appear on screen...")
         try:
+            # Extra validation to catch common issues early
+            if not os.path.isfile(self.buy_image_path):
+                raise FileNotFoundError(f"Buy image not found: {self.buy_image_path}")
+            if not os.path.isfile(self.sell_image_path):
+                raise FileNotFoundError(f"Sell image not found: {self.sell_image_path}")
+
             buy_center, sell_center = wait_for_images(screen, self.buy_image_path, self.sell_image_path, log, self.stop_event)
             log("Both buttons identified.")
         except Exception as e:
-            log(f"Error identifying buttons: {e}")
+            tb = traceback.format_exc()
+            log(f"Error identifying buttons: {e!r}\n{tb}")
             self.root.after(0, self.on_stop)
             return
 
