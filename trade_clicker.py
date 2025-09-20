@@ -407,6 +407,98 @@ class ScreenAutomation:
         else:
             self.direct.click(x=x, y=y)
 
+    # ---------- Color-aware helpers (used when OpenCV is available) ----------
+
+    def _screenshot_bgr(self):
+        """
+        Return current screen as a NumPy array in BGR order, or None if unavailable.
+        Requires OpenCV (cv2) and NumPy; only used when has_confidence is True.
+        """
+        if not self.has_confidence:
+            return None
+        try:
+            import numpy as np  # cv2 depends on numpy; should be present with cv2
+            from PIL import Image
+        except Exception:
+            return None
+
+        try:
+            pil_img = None
+            if self.backend == "pyautogui" and hasattr(self.pg, "screenshot"):
+                pil_img = self.pg.screenshot()
+            elif self.pyscreeze and hasattr(self.pyscreeze, "screenshot"):
+                pil_img = self.pyscreeze.screenshot()
+            if pil_img is None:
+                return None
+            rgb = np.array(pil_img)  # RGB
+            # Convert to BGR
+            bgr = rgb[:, :, ::-1].copy()
+            return bgr
+        except Exception:
+            return None
+
+    def classify_box_color(self, box) -> str:
+        """
+        Classify the dominant color in the given box as 'green', 'red', or 'other'.
+        Uses HSV thresholds on a screenshot. Returns 'other' if unavailable.
+        Only used when OpenCV is available.
+        """
+        if not self.has_confidence:
+            return "other"
+        try:
+            import cv2
+            import numpy as np
+        except Exception:
+            return "other"
+
+        bgr = self._screenshot_bgr()
+        if bgr is None:
+            return "other"
+
+        left, top, width, height = box
+        h, w = bgr.shape[:2]
+        x1 = max(int(left), 0)
+        y1 = max(int(top), 0)
+        x2 = min(int(left + width), w)
+        y2 = min(int(top + height), h)
+        if x2 <= x1 or y2 <= y1:
+            return "other"
+
+        roi = bgr[y1:y2, x1:x2]
+        if roi.size == 0:
+            return "other"
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+        # Thresholds
+        # Green: H in [35, 85], S and V not too low
+        lower_green = (35, 80, 60)
+        upper_green = (85, 255, 255)
+        mask_green = cv2.inRange(hsv, lower_green, upper_green)
+
+        # Red wraps around: [0,10] and [170,180]
+        lower_red1 = (0, 80, 60)
+        upper_red1 = (10, 255, 255)
+        lower_red2 = (170, 80, 60)
+        upper_red2 = (180, 255, 255)
+        mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        mask_red = cv2.bitwise_or(mask_red1, mask_red2)
+
+        # Compute ratios
+        total = roi.shape[0] * roi.shape[1]
+        if total == 0:
+            return "other"
+        green_ratio = float(np.count_nonzero(mask_green)) / float(total)
+        red_ratio = float(np.count_nonzero(mask_red)) / float(total)
+
+        # Heuristic thresholds
+        if green_ratio >= 0.12 and green_ratio > red_ratio * 1.2:
+            return "green"
+        if red_ratio >= 0.12 and red_ratio > green_ratio * 1.2:
+            return "red"
+        return "other"
+
 def locate_image_center(screen: "ScreenAutomation", path: str, confidence: Optional[float] = None, region: Optional[Tuple[int, int, int, int]] = None) -> Optional[Tuple[int, int, int, int]]:
     """
     Locate image on screen. Returns a Box (left, top, width, height) or None.
@@ -421,7 +513,8 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
     Wait until both Buy and Sell images are located on the screen.
     Ensures the two matches are different on-screen locations. If both initially
     resolve to the same area, retries the second search excluding a small region
-    around the first match.
+    around the first match. If OpenCV is available, validate color (BUY=green, SELL=red)
+    and discard mismatched color hits to reduce confusion from nearly identical shapes.
     Returns center points for both as ((x,y)_buy, (x,y)_sell).
     """
     start = time.time()
@@ -438,21 +531,30 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
         if buy_center is None:
             box = locate_image_center(screen, buy_img, CLICK_CONFIDENCE)
             if box:
-                bx, by = screen.center_of(box)
-                buy_box = box
-                buy_center = (bx, by)
-                log(f"Identified BUY button at {buy_center}")
+                # Color validation when available
+                color = screen.classify_box_color(box)
+                if color == "red":
+                    # Probably wrong (SELL-like); ignore and retry
+                    pass
+                else:
+                    bx, by = screen.center_of(box)
+                    buy_box = box
+                    buy_center = (bx, by)
+                    log(f"Identified BUY button at {buy_center}")
 
         # Try find SELL if missing
         if sell_center is None:
-            # If BUY is found and subsequent SELL search lands on the same box,
-            # re-search SELL while excluding a small region around BUY.
             box = locate_image_center(screen, sell_img, CLICK_CONFIDENCE)
             if box:
-                sx, sy = screen.center_of(box)
-                sell_box = box
-                sell_center = (sx, sy)
-                log(f"Identified SELL button at {sell_center}")
+                color = screen.classify_box_color(box)
+                if color == "green":
+                    # Probably wrong (BUY-like); ignore and retry
+                    pass
+                else:
+                    sx, sy = screen.center_of(box)
+                    sell_box = box
+                    sell_center = (sx, sy)
+                    log(f"Identified SELL button at {sell_center}")
 
         # If both found but centers are identical, attempt a disambiguation pass
         if buy_center and sell_center and buy_center == sell_center:
@@ -486,6 +588,10 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
             for r in regions:
                 alt_box = locate_image_center(screen, sell_img, CLICK_CONFIDENCE, region=r)
                 if alt_box:
+                    # Validate color for SELL
+                    color = screen.classify_box_color(alt_box)
+                    if color == "green":
+                        continue
                     found_alt = alt_box
                     break
 
@@ -498,6 +604,22 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
                 # Could not disambiguate now; clear SELL and retry in next loop
                 sell_center = None
                 sell_box = None
+
+        # If both found, as a final color sanity check (when available), correct or swap if needed
+        if buy_center and sell_center and screen.has_confidence:
+            buy_color = screen.classify_box_color(buy_box)
+            sell_color = screen.classify_box_color(sell_box)
+            if buy_color == "red" and sell_color == "green":
+                # Likely swapped; swap the assignments
+                buy_center, sell_center = sell_center, buy_center
+                buy_box, sell_box = sell_box, buy_box
+                log("Swapped BUY/SELL matches based on color validation.")
+            elif buy_color == "red":
+                # Discard BUY and retry
+                buy_center, buy_box = None, None
+            elif sell_color == "green":
+                # Discard SELL and retry
+                sell_center, sell_box = None, None
 
         if buy_center and sell_center:
             return buy_center, sell_center
