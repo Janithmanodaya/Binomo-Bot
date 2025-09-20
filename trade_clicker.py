@@ -45,8 +45,8 @@ pyautogui = None  # type: ignore
 # --------------- Configuration ---------------
 
 WORLD_TIME_API = "http://worldtimeapi.org/api/timezone/Asia/Colombo"
-TIME_RESYNC_SECONDS = 30  # periodically re-sync virtual time from internet
-IMAGE_SEARCH_INTERVAL = 1.5  # seconds between image search attempts
+TIME_RESYNC_SECONDS = 120  # periodically re-sync virtual time from internet (reduced network churn)
+IMAGE_SEARCH_INTERVAL = 2.0  # seconds between image search attempts (lower CPU usage)
 IMAGE_SEARCH_TIMEOUT = 300  # max seconds to wait for locating both buttons (5 minutes)
 CLICK_CONFIDENCE = 0.8  # used if OpenCV is available
 LOG_MAX_LINES = 500
@@ -186,7 +186,7 @@ class InternetTimeProvider:
     def sync(self):
         """Sync offset between system time and true Colombo time."""
         colombo_now = self._fetch_colombo_time()
-        system_now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+        system_now_utc = datetime.now(timezone.utc)
         # Use detected offset if available; otherwise fallback +05:30
         tz = colombo_now.tzinfo or self._tz_fallback
         system_as_colombo = system_now_utc.astimezone(tz)
@@ -202,7 +202,7 @@ class InternetTimeProvider:
             # If sync fails, keep previous offset and continue ticking locally
             pass
         # Use system time as base, apply offset to emulate Colombo internet time
-        system_now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+        system_now_utc = datetime.now(timezone.utc)
         tz = self._tz_fallback
         system_as_colombo = system_now_utc.astimezone(tz)
         return system_as_colombo + self._offset
@@ -382,6 +382,8 @@ class ScreenAutomation:
                     kwargs["confidence"] = confidence
                 if region is not None:
                     kwargs["region"] = region
+                # grayscale speeds matching in many cases
+                kwargs["grayscale"] = True
                 return self.pg.locateOnScreen(image_path, **kwargs)
             except Exception as e:
                 # If it's the "not found" case, return None instead of raising
@@ -390,6 +392,7 @@ class ScreenAutomation:
                 # Retry once without confidence (in case confidence unsupported), then handle not-found again
                 try:
                     kwargs.pop("confidence", None)
+                    kwargs["grayscale"] = True
                     return self.pg.locateOnScreen(image_path, **kwargs)
                 except Exception as e2:
                     if _is_not_found(e2):
@@ -403,12 +406,14 @@ class ScreenAutomation:
                     kwargs["confidence"] = confidence
                 if region is not None:
                     kwargs["region"] = region
+                kwargs["grayscale"] = True
                 return self.pyscreeze.locateOnScreen(image_path, **kwargs)
             except Exception as e:
                 if _is_not_found(e):
                     return None
                 try:
                     kwargs.pop("confidence", None)
+                    kwargs["grayscale"] = True
                     return self.pyscreeze.locateOnScreen(image_path, **kwargs)
                 except Exception as e2:
                     if _is_not_found(e2):
@@ -1063,7 +1068,7 @@ class TradeClickerApp:
                 exec_dt = next_signal_dt - timedelta(minutes=1)
                 log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
 
-            time.sleep(0.05)
+            time.sleep(0.1)
 
     # ---------- Run ----------
 
