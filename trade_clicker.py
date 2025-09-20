@@ -979,24 +979,41 @@ class TradeClickerApp:
 
     def _on_mode_change(self):
         mode = self.mode_var.get()
+
+        # Helper to set state on all children of a container
+        def set_children_state(container, state_value: str):
+            for child in container.winfo_children():
+                try:
+                    child.configure(state=state_value)
+                except Exception:
+                    # Not all ttk/tk widgets support state; ignore
+                    pass
+
         if mode == "session":
-            self.tg_frame.configure(state="normal")
-            for child in self.tg_frame.winfo_children():
-                try:
-                    child.configure(state="normal")
-                except Exception:
-                    pass
-            self.schedule_frame.configure(text="Schedule (disabled in Session mode)")
-            self.schedule_text.configure(state="disabled")
+            # Enable Telegram controls
+            set_children_state(self.tg_frame, "normal")
+            # Disable schedule text editing (but keep visible)
+            try:
+                self.schedule_text.configure(state="disabled")
+            except Exception:
+                pass
+            # Update label text for clarity
+            try:
+                self.schedule_frame.configure(text="Schedule (disabled in Session mode)")
+            except Exception:
+                pass
         else:
-            self.tg_frame.configure(state="normal")
-            for child in self.tg_frame.winfo_children():
-                try:
-                    child.configure(state="normal")
-                except Exception:
-                    pass
-            self.schedule_frame.configure(text="Schedule (HH:MM B/S, one per line)")
-            self.schedule_text.configure(state="normal")
+            # Disable Telegram controls to avoid confusion when in schedule mode
+            set_children_state(self.tg_frame, "disabled")
+            # Enable schedule editing
+            try:
+                self.schedule_text.configure(state="normal")
+            except Exception:
+                pass
+            try:
+                self.schedule_frame.configure(text="Schedule (HH:MM B/S, one per line)")
+            except Exception:
+                pass
 
     def choose_buy_image(self):
         path = filedialog.askopenfilename(
