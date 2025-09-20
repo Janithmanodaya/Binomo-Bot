@@ -233,25 +233,53 @@ class ScreenAutomation:
         self.pyscreeze = None
         self.direct = None
 
-        # Try pyautogui first
+        # Try pyautogui first WITHOUT installing, to avoid unnecessary installs
         try:
-            self.pg = ensure_package("pyautogui", "pyautogui", self.log)
+            self.pg = importlib.import_module("pyautogui")
+            ver = getattr(self.pg, "__version__", "?")
             self.backend = "pyautogui"
-            self.log("Using pyautogui backend.")
-        except Exception:
-            # Fallback: use pyscreeze + pydirectinput
-            self.pyscreeze = ensure_package("pyscreeze", "pyscreeze", self.log)
-            # PIL (Pillow) is required by pyscreeze.screenshot
-            ensure_package("PIL", "pillow", self.log)
-            # pydirectinput for sending clicks/moves
-            self.direct = ensure_package("pydirectinput", "pydirectinput", self.log)
-            # Optional: OpenCV to allow confidence param in locateOnScreen
+            self.log(f"Found pyautogui {ver}. Using pyautogui backend.")
+        except ImportError:
+            # Not installed; attempt to install
             try:
-                ensure_package("cv2", "opencv-python", self.log)
+                self.pg = ensure_package("pyautogui", "pyautogui", self.log)
+                ver = getattr(self.pg, "__version__", "?")
+                self.backend = "pyautogui"
+                self.log(f"Using pyautogui backend (installed {ver}).")
             except Exception:
-                pass
-            self.backend = "fallback"
-            self.log("Using fallback backend (pyscreeze + pydirectinput).")
+                # Fallback: use pyscreeze + pydirectinput
+                # pyscreeze
+                try:
+                    self.pyscreeze = importlib.import_module("pyscreeze")
+                    self.log("Found pyscreeze.")
+                except ImportError:
+                    self.pyscreeze = ensure_package("pyscreeze", "pyscreeze", self.log)
+
+                # Pillow (PIL)
+                try:
+                    importlib.import_module("PIL")
+                    self.log("Found pillow.")
+                except ImportError:
+                    ensure_package("PIL", "pillow", self.log)
+
+                # pydirectinput
+                try:
+                    self.direct = importlib.import_module("pydirectinput")
+                    self.log("Found pydirectinput.")
+                except ImportError:
+                    self.direct = ensure_package("pydirectinput", "pydirectinput", self.log)
+
+                # Optional: OpenCV to allow confidence param in locateOnScreen
+                try:
+                    importlib.import_module("cv2")
+                except ImportError:
+                    try:
+                        ensure_package("cv2", "opencv-python", self.log)
+                    except Exception:
+                        pass
+
+                self.backend = "fallback"
+                self.log("Using fallback backend (pyscreeze + pydirectinput).")
 
     def locate_on_screen(self, image_path: str, confidence: Optional[float] = None):
         if self.backend == "pyautogui":
