@@ -267,6 +267,31 @@ def find_next_signal(now_dt: datetime, schedule: List[Tuple[int, int, str]]) -> 
     candidate = datetime(tomorrow.year, tomorrow.month, tomorrow.day, h, m, 0, tzinfo=now_dt.tzinfo)
     return candidate, side
 
+
+def find_next_after(prev_signal_dt: datetime, schedule: List[Tuple[int, int, str]]) -> Tuple[datetime, str]:
+    """
+    Find the next schedule strictly after the given previous signal datetime (same day or next day).
+    This avoids reusing the same schedule when we operate relative to an execution time (signal-1min).
+    """
+    # Build an ordered list of today's datetimes for the schedule
+    if not schedule:
+        raise ValueError("Schedule is empty.")
+    base_date = prev_signal_dt.date()
+    tz = prev_signal_dt.tzinfo
+    seen_current = False
+    for h, m, side in schedule:
+        candidate = datetime(prev_signal_dt.year, prev_signal_dt.month, prev_signal_dt.day, h, m, 0, tzinfo=tz)
+        if candidate == prev_signal_dt:
+            seen_current = True
+            continue
+        if candidate > prev_signal_dt:
+            return candidate, side
+    # If we reach here, roll to tomorrow and take the first
+    h, m, side = schedule[0]
+    tomorrow = base_date + timedelta(days=1)
+    candidate = datetime(tomorrow.year, tomorrow.month, tomorrow.day, h, m, 0, tzinfo=tz)
+    return candidate, side
+
 # --------------- Image Recognition and Clicking ---------------
 
 class ScreenAutomation:
@@ -1008,9 +1033,9 @@ class TradeClickerApp:
                 log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
 
             else:
-                # >= 10s late relative to execution time, skip and schedule next
+                # >= 10s late relative to execution time, skip and schedule the next slot after this signal
                 log(f"Missed execution for signal {next_signal_dt.strftime('%H:%M')} {next_side} (>{int(delta_sec)}s late). Skipping.")
-                next_signal_dt, next_side = find_next_signal(now, schedule)
+                next_signal_dt, next_side = find_next_after(next_signal_dt, schedule)
                 exec_dt = next_signal_dt - timedelta(minutes=1)
                 log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
 
