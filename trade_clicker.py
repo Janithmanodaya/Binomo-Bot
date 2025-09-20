@@ -420,6 +420,53 @@ class ScreenAutomation:
                         return None
                     raise
 
+    def locate_all_on_screen(self, image_path: str, confidence: Optional[float] = None, region: Optional[Tuple[int, int, int, int]] = None):
+        """
+        Return an iterator (or list) of all matching boxes on screen. If unsupported, falls back to single locate.
+        """
+        if not self.has_confidence:
+            confidence = None
+
+        def _iter_pg(gen):
+            try:
+                for box in gen:
+                    yield box
+            except Exception:
+                return
+
+        if self.backend == "pyautogui":
+            try:
+                kwargs = {}
+                if confidence is not None:
+                    kwargs["confidence"] = confidence
+                if region is not None:
+                    kwargs["region"] = region
+                kwargs["grayscale"] = True
+                gen = self.pg.locateAllOnScreen(image_path, **kwargs)
+                # Some versions return a generator; normalize to iterator
+                for box in _iter_pg(gen):
+                    yield box
+            except Exception:
+                # Fallback to single locate
+                box = self.locate_on_screen(image_path, confidence=confidence, region=region)
+                if box:
+                    yield box
+        else:
+            try:
+                kwargs = {}
+                if confidence is not None:
+                    kwargs["confidence"] = confidence
+                if region is not None:
+                    kwargs["region"] = region
+                kwargs["grayscale"] = True
+                gen = self.pyscreeze.locateAllOnScreen(image_path, **kwargs)
+                for box in gen:
+                    yield box
+            except Exception:
+                box = self.locate_on_screen(image_path, confidence=confidence, region=region)
+                if box:
+                    yield box
+
     @staticmethod
     def center_of(box):
         # box is either a pyscreeze.Box or tuple (left, top, width, height)
@@ -583,20 +630,42 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
 
         # Try find BUY if missing
         if buy_center is None:
-            box = locate_with_fallbacks(buy_img)
-            if box:
-                # Accept the first reasonable match. We'll use color later as a hint,
-                # but do not block progress here to avoid infinite waiting.
-                bx, by = screen.center_of(box)
-                buy_box = box
+            # If OpenCV present, scan all matches and prefer those that look green
+            best_box = None
+            if screen.has_confidence:
+                for cand in screen.locate_all_on_screen(buy_img, confidence=CLICK_CONFIDENCE):
+                    color = screen.classify_box_color(cand)
+                    if color == "green":
+                        best_box = cand
+                        break
+                    if best_box is None:
+                        best_box = cand
+            else:
+                best_box = locate_with_fallbacks(buy_img)
+
+            if best_box:
+                bx, by = screen.center_of(best_box)
+                buy_box = best_box
                 buy_center = (bx, by)
                 log(f"Identified BUY button at {buy_center}")
 
         # Try find SELL if missing
         if sell_center is None:
-            box = locate_with_fallbacks(sell_img)
-            if box:
-                sx, sy = screen.center_of(box)
+            # If OpenCV present, scan all matches and prefer those that look red
+            best_box = None
+            if screen.has_confidence:
+                for cand in screen.locate_all_on_screen(sell_img, confidence=CLICK_CONFIDENCE):
+                    color = screen.classify_box_color(cand)
+                    if color == "red":
+                        best_box = cand
+                        break
+                    if best_box is None:
+                        best_box = cand
+            else:
+                best_box = locate_with_fallbacks(sell_img)
+
+            if best_box:
+                sx, sy = screen.center_of(best_box)
 
                 # If SELL initially lands on the same center as BUY, try to disambiguate immediately
                 if buy_center and (sx, sy) == buy_center:
@@ -621,13 +690,24 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
 
                     found_alt = None
                     for r in regions:
-                        alt_box = locate_with_fallbacks(sell_img, region=r)
-                        if alt_box:
-                            # Optional: quick color sanity for SELL
-                            color = screen.classify_box_color(alt_box)
+                        # Prefer red candidates in alternate regions
+                        alt_best = None
+                        if screen.has_confidence:
+                            for cand in screen.locate_all_on_screen(sell_img, confidence=CLICK_CONFIDENCE, region=r):
+                                color = screen.classify_box_color(cand)
+                                if color == "red":
+                                    alt_best = cand
+                                    break
+                                if alt_best is None:
+                                    alt_best = cand
+                        else:
+                            alt_best = locate_with_fallbacks(sell_img, region=r)
+
+                        if alt_best:
+                            color = screen.classify_box_color(alt_best)
                             if color == "green":
                                 continue
-                            found_alt = alt_box
+                            found_alt = alt_best
                             break
 
                     if found_alt:
@@ -640,7 +720,7 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
                         sell_center = None
                         sell_box = None
                 else:
-                    sell_box = box
+                    sell_box = best_box
                     sell_center = (sx, sy)
                     log(f"Identified SELL button at {sell_center}")
 
