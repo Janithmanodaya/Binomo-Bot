@@ -240,46 +240,37 @@ class ScreenAutomation:
             self.backend = "pyautogui"
             self.log(f"Found pyautogui {ver}. Using pyautogui backend.")
         except ImportError:
-            # Not installed; attempt to install
+            # Not installed; DO NOT auto-install. Try fallback imports only.
+            # pyscreeze
             try:
-                self.pg = ensure_package("pyautogui", "pyautogui", self.log)
-                ver = getattr(self.pg, "__version__", "?")
-                self.backend = "pyautogui"
-                self.log(f"Using pyautogui backend (installed {ver}).")
-            except Exception:
-                # Fallback: use pyscreeze + pydirectinput
-                # pyscreeze
-                try:
-                    self.pyscreeze = importlib.import_module("pyscreeze")
-                    self.log("Found pyscreeze.")
-                except ImportError:
-                    self.pyscreeze = ensure_package("pyscreeze", "pyscreeze", self.log)
+                self.pyscreeze = importlib.import_module("pyscreeze")
+                self.log("Found pyscreeze.")
+            except ImportError:
+                raise RuntimeError("pyscreeze not installed. Please install it or install pyautogui.")
 
-                # Pillow (PIL)
-                try:
-                    importlib.import_module("PIL")
-                    self.log("Found pillow.")
-                except ImportError:
-                    ensure_package("PIL", "pillow", self.log)
+            # Pillow (PIL)
+            try:
+                importlib.import_module("PIL")
+                self.log("Found pillow.")
+            except ImportError:
+                raise RuntimeError("pillow not installed. Please install it or install pyautogui.")
 
-                # pydirectinput
-                try:
-                    self.direct = importlib.import_module("pydirectinput")
-                    self.log("Found pydirectinput.")
-                except ImportError:
-                    self.direct = ensure_package("pydirectinput", "pydirectinput", self.log)
+            # pydirectinput
+            try:
+                self.direct = importlib.import_module("pydirectinput")
+                self.log("Found pydirectinput.")
+            except ImportError:
+                raise RuntimeError("pydirectinput not installed. Please install it or install pyautogui.")
 
-                # Optional: OpenCV to allow confidence param in locateOnScreen
-                try:
-                    importlib.import_module("cv2")
-                except ImportError:
-                    try:
-                        ensure_package("cv2", "opencv-python", self.log)
-                    except Exception:
-                        pass
+            # Optional: OpenCV to allow confidence param in locateOnScreen
+            try:
+                importlib.import_module("cv2")
+            except ImportError:
+                # fine; confidence search may be limited
+                pass
 
-                self.backend = "fallback"
-                self.log("Using fallback backend (pyscreeze + pydirectinput).")
+            self.backend = "fallback"
+            self.log("Using fallback backend (pyscreeze + pydirectinput).")
 
     def locate_on_screen(self, image_path: str, confidence: Optional[float] = None):
         if self.backend == "pyautogui":
