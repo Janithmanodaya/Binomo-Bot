@@ -212,6 +212,7 @@ class InternetTimeProvider:
 def parse_schedule(text: str) -> List[Tuple[int, int, str]]:
     """
     Parse schedule lines like "01:10 B" or "23:45 S" (case-insensitive B/S).
+    Also accepts synonyms: BUY/CALL => B, SELL/PUT => S.
 
     Returns: list of tuples (hour, minute, side) where side in {"B", "S"} sorted by time.
     """
@@ -234,10 +235,15 @@ def parse_schedule(text: str) -> List[Tuple[int, int, str]]:
                 continue
         except ValueError:
             continue
-        side = side.upper()
-        if side not in {"B", "S"}:
+        side_up = side.upper()
+        # Map synonyms to canonical B/S
+        if side_up in {"B", "BUY", "CALL"}:
+            canon = "B"
+        elif side_up in {"S", "SELL", "PUT"}:
+            canon = "S"
+        else:
             continue
-        entries.append((h, m, side))
+        entries.append((h, m, canon))
     # Sort by hour, then minute
     entries.sort(key=lambda x: (x[0], x[1]))
     return entries
@@ -868,37 +874,38 @@ class TradeClickerApp:
 
         # Main loop
         next_signal_dt, next_side = find_next_signal(self.time_provider.now(), schedule)
-        log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side}")
+        exec_dt = next_signal_dt - timedelta(minutes=1)
+        log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
 
         while not self.stop_event.is_set():
             now = self.time_provider.now()
 
             # Interval lockout check
-            if self.last_trade_at and interval_min > 0:
+            if self.last_trade_at and interval_min &gt; 0:
                 until = self.last_trade_at + timedelta(minutes=interval_min)
-                if now < until:
+                if now &lt; until:
                     # Still in lockout; skip signals that occur during lockout
                     # But we continue to advance next_signal_dt as time passes
                     pass
 
-            # Advance next_signal if it's in the past (missed) by >= 10s or we are beyond it
+            # Advance next execution if it's in the past (missed) by &gt;= 10s or we are beyond it
             # If we are before it, we can sleep a bit
-            if now < next_signal_dt:
+            if now &lt; exec_dt:
                 time.sleep(0.2)
                 continue
 
-            # We are at or after the scheduled minute
-            delta_sec = (now - next_signal_dt).total_seconds()
+            # We are at or after the execution minute (signal time minus one minute)
+            delta_sec = (now - exec_dt).total_seconds()
 
-            if delta_sec < 5:
+            if delta_sec &lt; 5:
                 # Wait until we reach +5s window start
                 time.sleep(0.2)
                 continue
-            elif 5 <= delta_sec < 10:
+            elif 5 &lt;= delta_sec &lt; 10:
                 # Eligible window to execute, but ensure lockout
                 in_lockout = False
-                if self.last_trade_at and interval_min > 0:
-                    if now < (self.last_trade_at + timedelta(minutes=interval_min)):
+                if self.last_trade_at and interval_min &gt; 0:
+                    if now &lt; (self.last_trade_at + timedelta(minutes=interval_min)):
                         in_lockout = True
 
                 if in_lockout:
@@ -933,13 +940,15 @@ class TradeClickerApp:
 
                 # Regardless, schedule next signal
                 next_signal_dt, next_side = find_next_signal(now, schedule)
-                log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side}")
+                exec_dt = next_signal_dt - timedelta(minutes=1)
+                log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
 
             else:
-                # >= 10s late, skip and schedule next
-                log(f"Missed signal {next_signal_dt.strftime('%H:%M')} {next_side} (>{int(delta_sec)}s late). Skipping.")
+                # &gt;= 10s late relative to execution time, skip and schedule next
+                log(f"Missed execution for signal {next_signal_dt.strftime('%H:%M')} {next_side} (&gt;{int(delta_sec)}s late). Skipping.")
                 next_signal_dt, next_side = find_next_signal(now, schedule)
-                log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side}")
+                exec_dt = next_signal_dt - timedelta(minutes=1)
+                log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
 
             time.sleep(0.05)
 
