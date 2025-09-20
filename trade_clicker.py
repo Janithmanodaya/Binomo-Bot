@@ -45,11 +45,13 @@ pyautogui = None  # type: ignore
 # --------------- Configuration ---------------
 
 WORLD_TIME_API = "http://worldtimeapi.org/api/timezone/Asia/Colombo"
-TIME_RESYNC_SECONDS = 120  # periodically re-sync virtual time from internet (reduced network churn)
+TIME_RESYNC_SECONDS = 3600  # re-sync virtual time from internet roughly once per hour
 IMAGE_SEARCH_INTERVAL = 2.0  # seconds between image search attempts (lower CPU usage)
 IMAGE_SEARCH_TIMEOUT = 300  # max seconds to wait for locating both buttons (5 minutes)
 CLICK_CONFIDENCE = 0.8  # used if OpenCV is available
 LOG_MAX_LINES = 500
+# Consider adjusting only if drift is meaningful to avoid tiny jitter adjustments
+TIME_DRIFT_THRESHOLD_SECONDS = 1.5
 
 # Auto-install helper
 def ensure_package(import_name: str, pip_name: Optional[str] = None, log=None):
@@ -193,7 +195,14 @@ class InternetTimeProvider:
         # Use detected offset if available; otherwise fallback +05:30
         tz = colombo_now.tzinfo or self._tz_fallback
         system_as_colombo = system_now_utc.astimezone(tz)
-        self._offset = colombo_now - system_as_colombo
+        new_offset = colombo_now - system_as_colombo
+        # Only update if drift is meaningful (avoid tiny jitter)
+        try:
+            drift = abs((new_offset - self._offset).total_seconds())
+        except Exception:
+            drift = TIME_DRIFT_THRESHOLD_SECONDS + 1.0
+        if self._last_sync == 0.0 or drift > TIME_DRIFT_THRESHOLD_SECONDS:
+            self._offset = new_offset
         self._last_sync = time.time()
 
     def _maybe_start_sync(self):
