@@ -33,9 +33,13 @@ from typing import List, Optional, Tuple
 import json
 import urllib.request
 import urllib.error
-import pyautogui
+import importlib
+import subprocess
 import os
 import sys
+
+# Optional global for delayed import (auto-installed on Start)
+pyautogui = None  # type: ignore
 
 # --------------- Configuration ---------------
 
@@ -45,6 +49,25 @@ IMAGE_SEARCH_INTERVAL = 1.5  # seconds between image search attempts
 IMAGE_SEARCH_TIMEOUT = 300  # max seconds to wait for locating both buttons (5 minutes)
 CLICK_CONFIDENCE = 0.8  # used if OpenCV is available
 LOG_MAX_LINES = 500
+
+# Auto-install helper
+def ensure_package(import_name: str, pip_name: Optional[str] = None, log=None):
+    """
+    Ensure a Python package is importable. If not, install via pip and import it.
+    """
+    try:
+        return importlib.import_module(import_name)
+    except ImportError:
+        if log:
+            try:
+                log(f"Installing dependency: {pip_name or import_name} ...")
+            except Exception:
+                pass
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name or import_name])
+        except Exception as e:
+            raise RuntimeError(f"Failed to install {pip_name or import_name}: {e}")
+        return importlib.import_module(import_name)
 
 # --------------- Utilities ---------------
 
