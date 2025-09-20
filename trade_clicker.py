@@ -564,11 +564,11 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
                     regions = []
                     if ex_top > 0:
                         regions.append((0, 0, width, ex_top))
-                    if ex_botto <m height:
+                    if ex_bottom < height:
                         regions.append((0, ex_bottom, width, height - ex_bottom))
                     if ex_left > 0:
                         regions.append((0, ex_top, ex_left, ex_bottom - ex_top))
-                    if ex_righ <t width:
+                    if ex_right < width:
                         regions.append((ex_right, ex_top, width - ex_right, ex_bottom - ex_top))
 
                     found_alt = None
@@ -577,7 +577,20 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
                         if alt_box:
                             # Optional: quick color sanity for SELL
                             color = screen.classify_box_color(alt_box)
-                           ")
+                            if color == "green":
+                                continue
+                            found_alt = alt_box
+                            break
+
+                    if found_alt:
+                        sx, sy = screen.center_of(found_alt)
+                        sell_box = found_alt
+                        sell_center = (sx, sy)
+                        log(f"Adjusted SELL match to {sell_center}")
+                    else:
+                        # Don't log the overlapping SELL; wait and try again next iteration
+                        sell_center = None
+                        sell_box = None
 
         # If both found but centers are identical, attempt a disambiguation pass
         if buy_center and sell_center and buy_center == sell_center:
