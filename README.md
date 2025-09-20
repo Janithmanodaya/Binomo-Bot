@@ -8,6 +8,7 @@ This repository contains a minimal, runnable baseline that:
 - Trains a LightGBM classifier with walk-forward validation.
 - Simulates a simple execution policy (market entry/exit next minute) with roundtrip costs (fees + slippage).
 - Reports statistical and economic metrics (accuracy, AUC, expectancy, Sharpe) and saves a per-minute prediction/PnL file.
+- NEW: Streamlit UI to configure runs, track progress, and view performance charts.
 
 Quick start
 1) Install dependencies
@@ -15,6 +16,9 @@ Quick start
 
 2) Run the pipeline with defaults (ETH/USDT on Binance, ~60 days of data)
    python src/run_pipeline.py
+
+Or use the UI (recommended for exploration)
+   streamlit run src/ui_app.py
 
 Common options (examples)
 - Change symbol:
@@ -40,9 +44,17 @@ What this baseline does
   Label UP if next_return > +tau, DOWN if next_return < -tau, else NEUTRAL (dropped from training).
 - Trains LightGBM on expanding windows, validates on out-of-sample rolling segments, and tunes the decision probability threshold on each validation fold to maximize realized PnL after costs.
 
+UI features
+- Configure dataset size (days), fees/slippage, folds, validation horizon, and threshold.
+- Live progress bar and fold-by-fold metrics as training proceeds.
+- Charts: cumulative PnL over time, trades per day.
+- Per-fold summary table and download button for predictions.csv.
+- If predictions already exist, the UI can visualize them without rerunning.
+
 Outputs
 - data/processed/predictions.csv: per-minute predictions, signals, and realized PnL for each fold.
 - Console summary with statistical metrics (accuracy, AUC) and economic metrics (expectancy, Sharpe, max drawdown, profit factor).
+- Streamlit dashboard with interactive charts and metrics.
 
 Notes and limitations
 - This is a simple market-in/market-out next-minute simulator; real execution can be improved with limit orders, partial fills, and depth-aware slippage models.

@@ -3,7 +3,7 @@ import os
 import math
 import time
 from dataclasses import dataclass
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional, Callable
 
 import numpy as np
 import pandas as pd
@@ -317,18 +317,32 @@ def run_pipeline(
     folds: int,
     val_days: int,
     default_prob_threshold: float,
+    progress_callback: Optional[Callable[[str, float], None]] = None,
+    fold_callback: Optional[Callable[[int, Dict[str, float]], None]] = None,
 ):
+    """
+    Run the pipeline and optionally report progress via callbacks.
+
+    progress_callback: called as progress_callback(stage:str, progress:float in [0,1])
+    fold_callback: called after each fold with metrics dict.
+    """
     ensure_dirs()
 
     # 1) Data
+    if progress_callback:
+        progress_callback("Fetching OHLCV", 0.05)
     print(f"Fetching {days} days of 1m OHLCV for {symbol} from Binance...")
     ohlcv = fetch_ohlcv_ccxt(symbol, days)
     raw_path = f"data/raw/{symbol.replace('/', '')}_1m.parquet"
     ohlcv.to_parquet(raw_path)
     print(f"Saved raw OHLCV: {raw_path} ({len(ohlcv):,} rows)")
+    if progress_callback:
+        progress_callback("Building features", 0.20)
 
     # 2) Features
     feats = build_features(ohlcv)
+    if progress_callback:
+        progress_callback("Labeling", 0.30)
 
     # 3) Labels
     labeled = build_labels(feats, cost)
@@ -347,6 +361,9 @@ def run_pipeline(
         next_ret_va = labeled.loc[va_mask, "next_ret"]
 
         print(f"\nFold {i}: train {tr_s} to {tr_e} ({len(X_tr):,} rows), validate {va_s} to {va_e} ({len(X_va):,} rows)")
+        if progress_callback:
+            # Allocate 0.7 budget to folds
+            progress_callback(f"Training fold {i}", 0.30 + 0.7 * (i - 1) / max(len(windows), 1))
 
         if y_tr.notna().sum() < 1000 or y_va.notna().sum() < 500:
             print("Insufficient labeled samples for this fold; skipping.")
@@ -379,22 +396,25 @@ def run_pipeline(
         pf = profit_factor(sim["pnl"])
         expectancy = sim["pnl"].mean()
 
-        summary_rows.append(
-            dict(
-                fold=i,
-                threshold=t_opt,
-                auc=auc,
-                accuracy=acc,
-                expectancy=expectancy,
-                sharpe=sharpe,
-                max_drawdown=mdd,
-                profit_factor=pf,
-                trades=(sim["signal"] != 0).sum(),
-                samples=len(sim),
-            )
+        metrics = dict(
+            fold=i,
+            threshold=t_opt,
+            auc=auc,
+            accuracy=acc,
+            expectancy=expectancy,
+            sharpe=sharpe,
+            max_drawdown=mdd,
+            profit_factor=pf,
+            trades=int((sim["signal"] != 0).sum()),
+            samples=int(len(sim)),
         )
+        summary_rows.append(metrics)
+        if fold_callback:
+            fold_callback(i, metrics)
 
         all_val_frames.append(sim)
+        if progress_callback:
+            progress_callback(f"Completed fold {i}", 0.30 + 0.7 * (i) / max(len(windows), 1))
 
     if not all_val_frames:
         raise RuntimeError("No validation results produced. Try increasing days or reducing folds/val_days.")
@@ -416,6 +436,11 @@ def run_pipeline(
     print(f"- Sharpe: {sharpe_ratio(results['pnl']):.3f}")
     print(f"- Profit factor: {profit_factor(results['pnl']):.3f}")
     print(f"- Max drawdown (cum PnL units): {max_drawdown(results['pnl'].cumsum()):.6f}")
+
+    if progress_callback:
+        progress_callback("Done", 1.0)
+
+    return results, summary, out_csv
 
 
 def parse_args():
