@@ -412,6 +412,27 @@ class TradeClickerApp:
         def log(msg: str):
             self.root.after(0, self.log, msg)
 
+        # Ensure required libraries (auto-install after Start)
+        try:
+            mod = ensure_package("pyautogui", "pyautogui", log)
+            global pyautogui
+            pyautogui = mod
+            log("pyautogui is ready.")
+        except Exception as e:
+            log(f"pyautogui installation failed: {e}")
+            self.root.after(0, self.on_stop)
+            return
+
+        # Try to ensure OpenCV for better image matching (optional)
+        try:
+            importlib.import_module("cv2")
+        except ImportError:
+            try:
+                ensure_package("cv2", "opencv-python", log)
+                log("Installed opencv-python for better image matching.")
+            except Exception as e:
+                log(f"OpenCV not available (optional): {e}")
+
         # Ensure internet time available
         log("Connecting to internet time service...")
         while not self.stop_event.is_set():
@@ -522,11 +543,10 @@ class TradeClickerApp:
     # ---------- Run ----------
 
 def main():
-    # Safety: Fail early if pyautogui fails to import display on non-GUI environments
-    try:
-        pyautogui.size()
-    except Exception as e:
-        print("PyAutoGUI not fully functional in this environment:", e, file=sys.stderr)
+    # Note: pyautogui will be prepared after Start; skip pre-check to allow auto-install.
+    root = tk.Tk()
+    app = TradeClickerApp(root)
+    root.mainlo_code"PyAutoGUI not fully functional in this environment:", e, file=sys.stderr)
 
     root = tk.Tk()
     app = TradeClickerApp(root)
