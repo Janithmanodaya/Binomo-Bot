@@ -537,30 +537,21 @@ def wait_for_images(screen: "ScreenAutomation", buy_img: str, sell_img: str, log
         if buy_center is None:
             box = locate_image_center(screen, buy_img, CLICK_CONFIDENCE)
             if box:
-                # Color validation when available
-                color = screen.classify_box_color(box)
-                if color == "red":
-                    # Probably wrong (SELL-like); ignore and retry
-                    pass
-                else:
-                    bx, by = screen.center_of(box)
-                    buy_box = box
-                    buy_center = (bx, by)
-                    log(f"Identified BUY button at {buy_center}")
+                # Accept the first reasonable match. We'll use color later as a hint,
+                # but do not block progress here to avoid infinite waiting.
+                bx, by = screen.center_of(box)
+                buy_box = box
+                buy_center = (bx, by)
+                log(f"Identified BUY button at {buy_center}")
 
         # Try find SELL if missing
         if sell_center is None:
             box = locate_image_center(screen, sell_img, CLICK_CONFIDENCE)
             if box:
-                color = screen.classify_box_color(box)
-                if color == "green":
-                    # Probably wrong (BUY-like); ignore and retry
-                    pass
-                else:
-                    sx, sy = screen.center_of(box)
-                    sell_box = box
-                    sell_center = (sx, sy)
-                    log(f"Identified SELL button at {sell_center}")
+                sx, sy = screen.center_of(box)
+                sell_box = box
+                sell_center = (sx, sy)
+                log(f"Identified SELL button at {sell_center}")
 
         # If both found but centers are identical, attempt a disambiguation pass
         if buy_center and sell_center and buy_center == sell_center:
