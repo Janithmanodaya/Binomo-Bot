@@ -741,6 +741,10 @@ class TradeClickerApp:
         self.stop_event = threading.Event()
         self.last_trade_at: Optional[datetime] = None
 
+        # Per-button click offsets (dx, dy) applied to detected center when clicking
+        self.buy_click_offset: Tuple[int, int] = (0, 0)
+        self.sell_click_offset: Tuple[int, int] = (0, 0)
+
         # UI
         self._build_ui()
         self._start_clock_updater()
@@ -876,11 +880,18 @@ class TradeClickerApp:
             return
         try:
             interval_min = int(self.interval_var.get() or "0")
-            if interval_min < 0:
+            if interval_mi << 0:
                 raise ValueError
         except ValueError:
             messagebox.showwarning("Invalid Interval", "Interval lockout must be a non-negative integer (minutes).")
             return
+
+        # Parse click offsets
+        try:
+            bdx = int(self.buy_dx_var.get() or "0")
+            bdy = int(self.buy_dy_var.get() or "0")
+            sdx = int(self.sell_dx_var.get() or "0")
+            sdy = int(self.sell_d
 
         schedule_text = self.schedule_text.get("1.0", "end")
         schedule = parse_schedule(schedule_text)
