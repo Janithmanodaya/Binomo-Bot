@@ -891,17 +891,18 @@ class TradeClickerApp:
             messagebox.showwarning("Invalid Interval", "Interval lockout must be a non-negative integer (minutes).")
             return
 
-        # Parse click offsets
-        try:
-            bdx = int(self.buy_dx_var.get() or "0")
-            bdy = int(self.buy_dy_var.get() or "0")
-            sdx = int(self.sell_dx_var.get() or "0")
-            sdy = int(self.sell_dy_var.get() or "0")
-        except ValueError:
-            messagebox.showwarning("Invalid Offsets", "Offsets must be integers (pixels).")
-            return
-        self.buy_click_offset = (bdx, bdy)
-        self.sell_click_offset = (sdx, sdy)
+        # Parse click offsets (tolerate older UI without offset fields)
+        if hasattr(self, "buy_dx_var") and hasattr(self, "buy_dy_var") and hasattr(self, "sell_dx_var") and hasattr(self, "sell_dy_var"):
+            try:
+                bdx = int(self.buy_dx_var.get() or "0")
+                bdy = int(self.buy_dy_var.get() or "0")
+                sdx = int(self.sell_dx_var.get() or "0")
+                sdy = int(self.sell_dy_var.get() or "0")
+            except ValueError:
+                messagebox.showwarning("Invalid Offsets", "Offsets must be integers (pixels).")
+                return
+        else:
+
 
         schedule_text = self.schedule_text.get("1.0", "end")
         schedule = parse_schedule(schedule_text)
