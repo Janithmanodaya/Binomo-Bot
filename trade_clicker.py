@@ -27,7 +27,7 @@ import threading
 import time
 import webbrowser
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 import json
@@ -38,6 +38,7 @@ import subprocess
 import os
 import sys
 import traceback
+import asyncio
 
 # Optional global for delayed import (auto-installed on Start)
 pyautogui = None  # type: ignore
@@ -901,9 +902,18 @@ class TradeClickerApp:
         self.interval_entry = ttk.Entry(settings, textvariable=self.interval_var, width=8)
         self.interval_entry.grid(row=0, column=3, sticky="w")
 
+        # Mode selection
+        mode_frame = ttk.Frame(settings)
+        mode_frame.grid(row=1, column=0, columnspan=4, sticky="we", pady=(6, 0))
+        ttk.Label(mode_frame, text="Mode:").grid(row=0, column=0, sticky="w")
+        self.mode_sched_rb = ttk.Radiobutton(mode_frame, text="Schedule", value="schedule", variable=self.mode_var, command=self._on_mode_change)
+        self.mode_tg_rb = ttk.Radiobutton(mode_frame, text="Session (Telegram)", value="session", variable=self.mode_var, command=self._on_mode_change)
+        self.mode_sched_rb.grid(row=0, column=1, padx=(8, 6))
+        self.mode_tg_rb.grid(row=0, column=2, padx=(6, 0))
+
         # Image selectors
         img_frame = ttk.Frame(settings)
-        img_frame.grid(row=1, column=0, columnspan=4, sticky="we", pady=(8, 0))
+        img_frame.grid(row=2, column=0, columnspan=4, sticky="we", pady=(8, 0))
         img_frame.grid_columnconfigure(1, weight=1)
         img_frame.grid_columnconfigure(3, weight=1)
 
@@ -919,11 +929,25 @@ class TradeClickerApp:
         self.sell_img_label.grid(row=1, column=1, sticky="we", pady=(6, 0))
         ttk.Button(img_frame, text="Choose...", command=self.choose_sell_image).grid(row=1, column=2, padx=6, pady=(6, 0))
 
-        # Schedule
-        schedule_frame = ttk.LabelFrame(self.root, text="Schedule (HH:MM B/S, one per line)", padding=8)
-        schedule_frame.pack(fill="both", expand=True, padx=12, pady=8)
+        # Telegram settings
+        self.tg_frame = ttk.LabelFrame(self.root, text="Telegram Session Trading", padding=8)
+        self.tg_frame.pack(fill="x", padx=12, pady=(6, 0))
+        grid = ttk.Frame(self.tg_frame)
+        grid.pack(fill="x")
+        ttk.Label(grid, text="API ID:").grid(row=0, column=0, sticky="e", padx=(0, 6), pady=4)
+        ttk.Entry(grid, textvariable=self.tg_api_id_var, width=16).grid(row=0, column=1, sticky="w", pady=4)
+        ttk.Label(grid, text="API Hash:").grid(row=0, column=2, sticky="e", padx=(12, 6))
+        ttk.Entry(grid, textvariable=self.tg_api_hash_var, width=32).grid(row=0, column=3, sticky="w")
+        ttk.Label(grid, text="Phone (+ccnumber):").grid(row=1, column=0, sticky="e", padx=(0, 6), pady=4)
+        ttk.Entry(grid, textvariable=self.tg_phone_var, width=20).grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Label(grid, text="Source chat (@username or ID):").grid(row=1, column=2, sticky="e", padx=(12, 6))
+        ttk.Entry(grid, textvariable=self.tg_chat_var, width=28).grid(row=1, column=3, sticky="w")
 
-        self.schedule_text = tk.Text(schedule_frame, height=12, wrap="none", font=("Consolas", 11))
+        # Schedule
+        self.schedule_frame = ttk.LabelFrame(self.root, text="Schedule (HH:MM B/S, one per line)", padding=8)
+        self.schedule_frame.pack(fill="both", expand=True, padx=12, pady=8)
+
+        self.schedule_text = tk.Text(self.schedule_frame, height=12, wrap="none", font=("Consolas", 11))
         self.schedule_text.pack(fill="both", expand=True)
         self.schedule_text.insert("1.0", "01:00 S\n01:05 B\n01:10 B\n01:15 S\n01:20 S\n01:25 B\n01:30 S\n01:35 S\n")
 
@@ -941,7 +965,31 @@ class TradeClickerApp:
         self.log_text = tk.Text(log_frame, height=10, wrap="word", state="disabled", font=("Consolas", 10))
         self.log_text.pack(fill="both", expand=True)
 
+        # Initial mode update
+        self._on_mode_change()
+
     # ---------- UI Handlers ----------
+
+    def _on_mode_change(self):
+        mode = self.mode_var.get()
+        if mode == "session":
+            self.tg_frame.configure(state="normal")
+            for child in self.tg_frame.winfo_children():
+                try:
+                    child.configure(state="normal")
+                except Exception:
+                    pass
+            self.schedule_frame.configure(text="Schedule (disabled in Session mode)")
+            self.schedule_text.configure(state="disabled")
+        else:
+            self.tg_frame.configure(state="normal")
+            for child in self.tg_frame.winfo_children():
+                try:
+                    child.configure(state="normal")
+                except Exception:
+                    pass
+            self.schedule_frame.configure(text="Schedule (HH:MM B/S, one per line)")
+            self.schedule_text.configure(state="normal")
 
     def choose_buy_image(self):
         path = filedialog.askopenfilename(
@@ -1016,17 +1064,56 @@ class TradeClickerApp:
         self.buy_click_offset = (bdx, bdy)
         self.sell_click_offset = (sdx, sdy)
 
-        schedule_text = self.schedule_text.get("1.0", "end")
-        schedule = parse_schedule(schedule_text)
-        if not schedule:
-            messagebox.showwarning("Invalid Schedule", "Please provide at least one valid schedule line (HH:MM B/S).")
-            return
-
         # Disable start, enable stop
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.stop_event.clear()
         self.last_trade_at = None
+
+        if self.mode_var.get() == "session":
+            # Validate Telegram settings
+            try:
+                api_id = int(self.tg_api_id_var.get().strip())
+            except Exception:
+                messagebox.showwarning("Missing API ID", "Please enter a valid Telegram API ID (integer).")
+                self.start_btn.configure(state="normal")
+                self.stop_btn.configure(state="disabled")
+                return
+            api_hash = self.tg_api_hash_var.get().strip()
+            if not api_hash:
+                messagebox.showwarning("Missing API Hash", "Please enter your Telegram API Hash.")
+                self.start_btn.configure(state="normal")
+                self.stop_btn.configure(state="disabled")
+                return
+            phone = self.tg_phone_var.get().strip()
+            if not phone:
+                messagebox.showwarning("Missing Phone", "Please enter your Telegram phone number.")
+                self.start_btn.configure(state="normal")
+                self.stop_btn.configure(state="disabled")
+                return
+            chat = self.tg_chat_var.get().strip()
+            if not chat:
+                messagebox.showwarning("Missing Source Chat", "Please enter a source chat (@username or numeric ID).")
+                self.start_btn.configure(state="normal")
+                self.stop_btn.configure(state="disabled")
+                return
+
+            self.worker_thread = threading.Thread(
+                target=self.worker_session_main,
+                args=(url, api_id, api_hash, phone, chat, interval_min),
+                daemon=True
+            )
+            self.worker_thread.start()
+            return
+
+        # Schedule mode
+        schedule_text = self.schedule_text.get("1.0", "end")
+        schedule = parse_schedule(schedule_text)
+        if not schedule:
+            messagebox.showwarning("Invalid Schedule", "Please provide at least one valid schedule line (HH:MM B/S).")
+            self.start_btn.configure(state="normal")
+            self.stop_btn.configure(state="disabled")
+            return
 
         self.worker_thread = threading.Thread(
             target=self.worker_main,
@@ -1176,12 +1263,204 @@ class TradeClickerApp:
 
             else:
                 # >= 10s late relative to execution time, skip and schedule the next slot after this signal
-                log(f"Missed execution for signal {next_signal_dt.strftime('%H:%M')} {next_side} (>{int(delta_sec)}s late). Skipping.")
+                log(f"Missed execution for signal {next_signal_dt.strftime('%H:%M')} {next_side} (> {int(delta_sec)}s late). Skipping.")
                 next_signal_dt, next_side = find_next_after(next_signal_dt, schedule)
                 exec_dt = next_signal_dt - timedelta(minutes=1)
                 log(f"Next signal at {next_signal_dt.strftime('%H:%M')} {next_side} (execute at {exec_dt.strftime('%H:%M')})")
 
             time.sleep(0.1)
+
+    def worker_session_main(self, url: str, api_id: int, api_hash: str, phone: str, chat: str, interval_min: int):
+        def log(msg: str):
+            self.root.after(0, self.log, msg)
+
+        # Ensure Telethon is available
+        try:
+            Telethon = ensure_package("telethon", "telethon", log=log)
+            # from telethon import TelegramClient, events
+            TelegramClient = getattr(Telethon, "TelegramClient")
+            events = getattr(Telethon, "events")
+        except Exception as e:
+            log(f"Failed to prepare Telegram client: {e}")
+            self.root.after(0, self.on_stop)
+            return
+
+        # Prepare screen automation
+        try:
+            screen = ScreenAutomation(log=log)
+        except Exception as e:
+            log(f"Failed to prepare screen automation backend: {e}")
+            self.root.after(0, self.on_stop)
+            return
+
+        # Ensure internet time available (for clock/log consistency)
+        log("Connecting to internet time service...")
+        while not self.stop_event.is_set():
+            try:
+                self.time_provider.sync()
+                break
+            except Exception as e:
+                log(f"Time sync failed: {e}. Retrying in 3s...")
+                time.sleep(3)
+
+        if self.stop_event.is_set():
+            return
+
+        # Open URL in default browser
+        log(f"Opening URL: {url}")
+        try:
+            webbrowser.open(url, new=1, autoraise=True)
+        except Exception as e:
+            log(f"Failed to open browser: {e}")
+
+        # Identify Buy/Sell buttons
+        log("Waiting for BUY and SELL buttons to appear on screen...")
+        try:
+            if not os.path.isfile(self.buy_image_path):
+                raise FileNotFoundError(f"Buy image not found: {self.buy_image_path}")
+            if not os.path.isfile(self.sell_image_path):
+                raise FileNotFoundError(f"Sell image not found: {self.sell_image_path}")
+            if os.path.samefile(self.buy_image_path, self.sell_image_path):
+                raise ValueError("Buy and Sell images are the same file. Please select two different images.")
+
+            buy_center, sell_center = wait_for_images(screen, self.buy_image_path, self.sell_image_path, log, self.stop_event)
+            log("Both buttons identified.")
+        except Exception as e:
+            tb = traceback.format_exc()
+            log(f"Error identifying buttons: {e!r}\n{tb}")
+            self.root.after(0, self.on_stop)
+            return
+
+        # Click helpers
+        def click_buy():
+            try:
+                x, y = buy_center
+                x += self.buy_click_offset[0]
+                y += self.buy_click_offset[1]
+                screen.move_to(x, y, duration=0.2)
+                screen.click(x, y)
+                self.last_trade_at = self.time_provider.now()
+                log("Executed BUY by Telegram signal.")
+            except Exception as e:
+                log(f"Error clicking BUY: {e}")
+
+        def click_sell():
+            try:
+                x, y = sell_center
+                x += self.sell_click_offset[0]
+                y += self.sell_click_offset[1]
+                screen.move_to(x, y, duration=0.2)
+                screen.click(x, y)
+                self.last_trade_at = self.time_provider.now()
+                log("Executed SELL by Telegram signal.")
+            except Exception as e:
+                log(f"Error clicking SELL: {e}")
+
+        # Message parsing
+        def parse_signal(evt_msg) -> Optional[str]:
+            try:
+                text = ""
+                try:
+                    text = (evt_msg.raw_text or "").lower()
+                except Exception:
+                    try:
+                        text = (evt_msg.message.raw_text or "").lower()
+                    except Exception:
+                        text = ""
+                if any(w in text for w in [" buy", "buy ", " buy ", "call", "long"]):
+                    return "B"
+                if any(w in text for w in [" sell", "sell ", " sell ", "put", "short"]):
+                    return "S"
+
+                # Try file name of sticker/document
+                try:
+                    name = (evt_msg.file and evt_msg.file.name) or ""
+                    name = (name or "").lower()
+                    if any(w in name for w in ["buy", "call", "long"]):
+                        return "B"
+                    if any(w in name for w in ["sell", "put", "short"]):
+                        return "S"
+                except Exception:
+                    pass
+
+                # Try emoji heuristics
+                try:
+                    em = getattr(evt_msg, "emoji", None)
+                    if em:
+                        if em in {"✅", "🟢", "📈"}:
+                            return "B"
+                        if em in {"❌", "🔴", "📉"}:
+                            return "S"
+                except Exception:
+                    pass
+            except Exception:
+                return None
+            return None
+
+        # Async runner
+        def run_async():
+            async def main_async():
+                session_name = "trade_clicker_session"
+                client = TelegramClient(session_name, api_id, api_hash)
+
+                await client.connect()
+                if not await client.is_user_authorized():
+                    try:
+                        await client.send_code_request(phone)
+                        code = simpledialog.askstring("Telegram Login", f"Enter the login code sent to {phone}:", parent=self.root)
+                        if not code:
+                            raise RuntimeError("No login code provided.")
+                        try:
+                            await client.sign_in(phone=phone, code=code)
+                        except Exception:
+                            # Might require password (2FA)
+                            pwd = simpledialog.askstring("Telegram 2FA", "Enter your Telegram password (if set):", show="*", parent=self.root)
+                            if not pwd:
+                                raise
+                            await client.sign_in(password=pwd)
+                    except Exception as e:
+                        log(f"Telegram login failed: {e}")
+                        await client.disconnect()
+                        self.root.after(0, self.on_stop)
+                        return
+
+                # Restrict to a specific chat if provided
+                chats_param = None
+                target = chat.strip()
+                if target:
+                    chats_param = target
+
+                @client.on(events.NewMessage(chats=chats_param))
+                async def handler(event):
+                    if self.stop_event.is_set():
+                        return
+                    side = parse_signal(event)
+                    if not side:
+                        return
+                    # Optional interval lockout
+                    if self.last_trade_at and interval_min > 0:
+                        if self.time_provider.now() < (self.last_trade_at + timedelta(minutes=interval_min)):
+                            log("In lockout window, ignoring Telegram signal.")
+                            return
+                    if side == "B":
+                        click_buy()
+                    elif side == "S":
+                        click_sell()
+
+                log("Listening to Telegram messages... (keep the app running)")
+                # Run until stop
+                while not self.stop_event.is_set():
+                    await asyncio.sleep(0.3)
+                await client.disconnect()
+
+            try:
+                asyncio.run(main_async())
+            except Exception as e:
+                log(f"Telegram session ended with error: {e}")
+                self.root.after(0, self.on_stop)
+
+        # Launch async client in this worker thread
+        run_async()
 
     # ---------- Run ----------
 
