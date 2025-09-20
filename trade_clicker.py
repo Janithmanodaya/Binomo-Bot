@@ -13,8 +13,10 @@ Features:
     01:10 B
   The app will:
     * Find the next signal time greater than current time
-    * Execute at the start of the signal minute (0–5s window) and click the correct image/button
-    * If the signal is more than 5 seconds late (>= HH:MM:05), it skips the trade
+    * Execute in a 0–5s window of the configured execution minute:
+        - Exact signal time mode: execute at HH:MM (0–5s window)
+        - Early mode: execute at HH:MM-1 (0–5s window)
+    * If more than 5 seconds late (>= HH:MM:05 of the chosen minute), it skips the trade
     * Optional interval lockout (e.g., 15 min) to avoid opening another trade too soon
 
 Notes:
@@ -901,9 +903,18 @@ class TradeClickerApp:
         self.interval_entry = ttk.Entry(settings, textvariable=self.interval_var, width=8)
         self.interval_entry.grid(row=0, column=3, sticky="w")
 
+        # Toggle: exact signal time vs 1 minute earlier
+        self.execute_exact_var = tk.BooleanVar(value=False)
+        self.execute_exact_check = ttk.Checkbutton(
+            settings,
+            text="Exact signal time (0–5s window). If off: place order 1 minute earlier.",
+            variable=self.execute_exact_var
+        )
+        self.execute_exact_check.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
         # Image selectors
         img_frame = ttk.Frame(settings)
-        img_frame.grid(row=1, column=0, columnspan=4, sticky="we", pady=(8, 0))
+        img_frame.grid(row=2, column=0, columnspan=4, sticky="we", pady=(8_code, new0</))0))
         img_frame.grid_columnconfigure(1, weight=1)
         img_frame.grid_columnconfigure(3, weight=1)
 
