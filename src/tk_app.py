@@ -113,7 +113,8 @@ class LiveApp(tk.Tk):
         self.load_adv_btn = ttk.Button(adv_btns, text="Load Advanced Model...", command=self.load_advanced_model_dialog)
         self.load_adv_btn.pack(side=tk.LEFT, padx=(8, 0))
         self.dl_hist_btn = ttk.Button(adv_btns, text="Download History", command=self.download_history_now)
-        self.dl_hist_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.dl_hist_btn.pack(side=tk.LEFT, padx=(8,_code 0new)</)
+)
 
         # Training progress
         progf = ttk.LabelFrame(frm, text="Training progress", padding=10)
