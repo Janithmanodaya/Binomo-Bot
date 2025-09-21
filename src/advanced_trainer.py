@@ -161,21 +161,43 @@ def _eval_model_pnl(
 ) -> Tuple[float, float]:
     """
     Return (best_threshold, mean_pnl) on validation using cost-aware pnl.
+
+    IMPORTANT: Uses CONDITIONAL p_up = P(up | non-flat) for both tuning and signal generation
+    to match the live advanced decision logic.
     """
     import lightgbm as lgb  # type: ignore
     proba_va = model.predict(X_va, num_iteration=getattr(model, "best_iteration", None))
     if proba_va is None or len(proba_va) == 0:
         return 0.55, -1e9
-    proba_up = proba_va[:, class_to_idx[1]] + proba_va[:, class_to_idx[2]]
-    proba_up_s = pd.Series(proba_up, index=X_va.index)
-    threshold = tune_threshold_for_pnl(proba_up_s, next_ret_va.loc[proba_up_s.index], cost)
-    # Compute mean pnl at this threshold
-    t = float(threshold)
+
+    p_down2 = proba_va[:, class_to_idx[-2]]
+    p_down1 = proba_va[:, class_to_idx[-1]]
+    p_flat  = proba_va[:, class_to_idx[0]]
+    p_up1   = proba_va[:, class_to_idx[1]]
+    p_up2   = proba_va[:, class_to_idx[2]]
+
+    p_up_raw = p_up1 + p_up2
+    p_down_raw = p_down1 + p_down2
+    p_nonflat = p_up_raw + p_down_raw
+    with np.errstate(divide="ignore", invalid="ignore"):
+        p_up_cond = np.where(p_nonflat > 1e-12, p_up_raw / p_nonflat, 0.5)
+
+    p_up_cond_s = pd.Series(p_up_cond, index=X_va.index)
     rt_cost = cost.roundtrip_cost_ret
-    signal = np.where(proba_up_s > t, 1, np.where(proba_up_s < 1 - t, -1, 0))
-    pnl = np.where(signal == 1, next_ret_va - rt_cost, np.where(signal == -1, -next_ret_va - rt_cost, 0.0))
-    mean_pnl = float(np.mean(pnl))
-    return float(threshold), mean_pnl
+
+    # Sweep thresholds on conditional p_up in a wider band to reduce overtrading
+    thresholds = np.linspace(0.55, 0.85, 31)
+    best_t = 0.65
+    best_mean = -1e9
+    for t in thresholds:
+        signal = np.where(p_up_cond_s > t, 1, np.where(p_up_cond_s < 1 - t, -1, 0))
+        pnl = np.where(signal == 1, next_ret_va - rt_cost, np.where(signal == -1, -next_ret_va - rt_cost, 0.0))
+        mean_pnl = float(np.mean(pnl))
+        if mean_pnl > best_mean:
+            best_mean = mean_pnl
+            best_t = float(t)
+
+    return float(best_t), float(best_mean)
 
 
 def train_multilevel_model(
@@ -314,8 +336,21 @@ def train_multilevel_model(
         X_bt = X_all.loc[idx_bt]
         next_ret_bt = labeled.loc[idx_bt, "next_ret"]
         proba_bt = best_model.predict(X_bt, num_iteration=getattr(best_model, "best_iteration", None))
-        p_up_bt = proba_bt[:, class_to_idx[1]] + proba_bt[:, class_to_idx[2]]
-        p_up_bt_s = pd.Series(p_up_bt, index=idx_bt)
+
+        # Compute CONDITIONAL p_up for backtest to match live logic
+        p_down2_bt = proba_bt[:, class_to_idx[-2]]
+        p_down1_bt = proba_bt[:, class_to_idx[-1]]
+        p_flat_bt  = proba_bt[:, class_to_idx[0]]
+        p_up1_bt   = proba_bt[:, class_to_idx[1]]
+        p_up2_bt   = proba_bt[:, class_to_idx[2]]
+
+        p_up_raw_bt = p_up1_bt + p_up2_bt
+        p_down_raw_bt = p_down1_bt + p_down2_bt
+        p_nonflat_bt = p_up_raw_bt + p_down_raw_bt
+        with np.errstate(divide="ignore", invalid="ignore"):
+            p_up_cond_bt = np.where(p_nonflat_bt > 1e-12, p_up_raw_bt / p_nonflat_bt, 0.5)
+
+        p_up_bt_s = pd.Series(p_up_cond_bt, index=idx_bt)
         t = float(best_thr)
         rt_cost = cost.roundtrip_cost_ret
         signal_bt = np.where(p_up_bt_s > t, 1, np.where(p_up_bt_s < 1 - t, -1, 0))
