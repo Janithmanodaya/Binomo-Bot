@@ -174,36 +174,73 @@ class LiveApp(tk.Tk):
         return ts.tz_convert("UTC")
 
     def _fetch_prices_for_ts(self, symbol: str, ts_utc: pd.Timestamp) -> Optional[Dict[str, float]]:
+        """
+        Robustly fetch entry (c0) and next (c1) close prices for a given UTC minute.
+        Tries an anchored fetch using 'since' to guarantee inclusion of the desired candles,
+        and falls back to a larger recent window if needed.
+        """
         try:
             import ccxt
             ex = ccxt.binance({"enableRateLimit": True})
-            raw = ex.fetch_ohlcv(symbol, timeframe="1m", limit=5)
-            df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-            df = df.set_index("timestamp").sort_index().drop_duplicates()
+            ts_utc = pd.Timestamp(ts_utc).tz_convert("UTC")
             next_ts = (ts_utc.floor("T") + pd.Timedelta(minutes=1)).tz_convert("UTC")
-            if ts_utc in df.index and next_ts in df.index:
-                return {"c0": float(df.loc[ts_utc, "close"]), "c1": float(df.loc[next_ts, "close"])}
+
+            # 1) Try anchored fetch around the target minute
+            since_ms = int((ts_utc - pd.Timedelta(minutes=2)).timestamp() * 1000)
+            try:
+                raw = ex.fetch_ohlcv(symbol, timeframe="1m", since=since_ms, limit=10)
+            except Exception:
+                raw = []
+
+            def to_df(rows):
+                df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+                df = df.set_index("timestamp").sort_index().drop_duplicates()
+                return df
+
+            ok = False
+            if raw:
+                df = to_df(raw)
+                if (ts_utc in df.index) and (next_ts in df.index):
+                    ok = True
+                    return {"c0": float(df.loc[ts_utc, "close"]), "c1": float(df.loc[next_ts, "close"])}
+
+            # 2) Fallback: fetch a larger recent window
+            if not ok:
+                raw2 = ex.fetch_ohlcv(symbol, timeframe="1m", limit=120)
+                if raw2:
+                    df2 = to_df(raw2)
+                    if (ts_utc in df2.index) and (next_ts in df2.index):
+                        return {"c0": float(df2.loc[ts_utc, "close"]), "c1": float(df2.loc[next_ts, "close"])}
+
         except Exception:
-            return None
+            pass
         return None
 
     def _maybe_open_virtual_trade(self, symbol: str, signal: int, confidence: float, ts_local_str: str):
+        """
+        Open a virtual trade only if we can reliably resolve entry and next prices
+        for the prediction timestamp. Otherwise skip and log.
+        """
         try:
             if signal == 0 or confidence < float(self._min_conf_var.get()):
                 return
             ts_utc = self._to_utc_from_local_str(ts_local_str)
             prices = self._fetch_prices_for_ts(symbol, ts_utc)
-            entry_price = prices["c0"] if prices else float("nan")
+            if not prices:
+                # Could not fetch matching candles; skip opening this trade
+                self._append_live_log(f"Warning: could not resolve entry price for {ts_local_str}; skipping virtual trade.\n")
+                return
+            entry_price = float(prices["c0"])
             side = "LONG" if signal == 1 else "SHORT"
             self._pending_trade = dict(
                 entry_ts=ts_local_str,
                 side=side,
-                entry_price=float(entry_price),
+                entry_price=entry_price,
                 confidence=float(confidence),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            self._append_live_log(f"Virtual trade open error: {e}\n")
 
     def _close_virtual_trade(self, symbol: str, ts_local_str: str, correct: Optional[bool] = None):
         if not self._pending_trade:
