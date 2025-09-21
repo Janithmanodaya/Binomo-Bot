@@ -91,14 +91,30 @@ class LiveApp(tk.Tk):
             widget.grid(row=r, column=1, sticky="we", padx=4, pady=3)
 
         cfg.columnconfigure(1, weight=1)
-        add_row(cfg, 0, "Model type:", ttk.Combobox(cfg, textvariable=self.model_type, values=["Advanced", "Basic"], state="readonly"))
-        add_row(cfg, 1, "Symbol (Binance spot):", ttk.Entry(cfg, textvariable=self.symbol_var))
-        add_row(cfg, 2, "Taker fee per side (bps):", ttk.Spinbox(cfg, from_=0.0, to=50.0, increment=0.5, textvariable=self.taker_var))
-        add_row(cfg, 3, "Slippage per side (bps):", ttk.Spinbox(cfg, from_=0.0, to=50.0, increment=0.5, textvariable=self.slip_var))
-        add_row(cfg, 4, "Train days (history):", ttk.Spinbox(cfg, from_=2, to=180, textvariable=self.live_train_days))
-        add_row(cfg, 5, "Feature minutes (recent):", ttk.Spinbox(cfg, from_=500, to=5000, increment=100, textvariable=self.live_feat_minutes))
-        add_row(cfg, 6, "Default decision threshold:", ttk.Spinbox(cfg, from_=0.50, to=0.90, increment=0.01, textvariable=self.live_default_thresh))
-        add_row(cfg, 7, "Min confidence (virtual trade):", ttk.Spinbox(cfg, from_=0.00, to=1.00, increment=0.01, textvariable=self._min_conf_var))
+
+        cb_model_type = ttk.Combobox(cfg, textvariable=self.model_type, values=["Advanced", "Basic"], state="readonly")
+        add_row(cfg, 0, "Model type:", cb_model_type)
+
+        ent_symbol = ttk.Entry(cfg, textvariable=self.symbol_var)
+        add_row(cfg, 1, "Symbol (Binance spot):", ent_symbol)
+
+        spin_taker = ttk.Spinbox(cfg, from_=0.0, to=50.0, increment=0.5, textvariable=self.taker_var)
+        add_row(cfg, 2, "Taker fee per side (bps):", spin_taker)
+
+        spin_slip = ttk.Spinbox(cfg, from_=0.0, to=50.0, increment=0.5, textvariable=self.slip_var)
+        add_row(cfg, 3, "Slippage per side (bps):", spin_slip)
+
+        spin_days = ttk.Spinbox(cfg, from_=2, to=180, textvariable=self.live_train_days)
+        add_row(cfg, 4, "Train days (history):", spin_days)
+
+        spin_feat = ttk.Spinbox(cfg, from_=500, to=5000, increment=100, textvariable=self.live_feat_minutes)
+        add_row(cfg, 5, "Feature minutes (recent):", spin_feat)
+
+        spin_def_thr = ttk.Spinbox(cfg, from_=0.50, to=0.90, increment=0.01, textvariable=self.live_default_thresh)
+        add_row(cfg, 6, "Default decision threshold:", spin_def_thr)
+
+        spin_min_conf = ttk.Spinbox(cfg, from_=0.00, to=1.00, increment=0.01, textvariable=self._min_conf_var)
+        add_row(cfg, 7, "Min confidence (virtual trade):", spin_min_conf)
         # Break out widget creation to avoid very long argument lists on one line
         spin_trials = ttk.Spinbox(cfg, from_=1, to=200, increment=1, textvariable=self.adv_trials_var)
         add_row(cfg, 8, "Advanced trials (HPO):", spin_trials)
