@@ -236,21 +236,21 @@ with tabs[1]:
                 raw2["timestamp"] = pd.to_datetime(raw2["timestamp"], unit="ms", utc=True)
                 raw2 = raw2.set_index("timestamp").sort_index().drop_duplicates()
 
-                correct = None
-                if ts in raw2.index and next_ts in raw2.index:
+                # Evaluate correctness and update live metrics/table
+                if (ts in raw2.index) and (next_ts in raw2.index):
                     c0 = float(raw2.loc[ts, "close"])
                     c1 = float(raw2.loc[next_ts, "close"])
-                    next_ret = float(np.log(c1) - np.log(c0))  # type: ignore[name-defined]
+                    next_ret = float(np.log(c1) - np.log(c0))
                     tau = cost.roundtrip_cost_ret
+
                     if signal == 1:
-                        correct = next_ret > tau
-                        pnl = next_ret - tau
+                        correct = bool(next_ret > tau)
+                        pnl = float(next_ret - tau)
                     elif signal == -1:
-                        correct = next_ret < -tau
-                        pnl = -next_ret - tau
+                        correct = bool(next_re <p -tau)
+                        pnl = float(-next_ret - tau)
                     else:
-                        correct = abs(next_ret) <= tau
-                        pnl = 0.0
+                                        pnl = 0.0
 
                     # mark eligibility by confidence threshold and non-flat signal
                     eligible = bool((signal != 0) and (confidence >= min_conf))
