@@ -27,6 +27,15 @@ import lightgbm as lgb  # type: ignore
 st.set_page_config(page_title="Crypto Baseline Trainer", layout="wide")
 st.title("Cost-aware 1m Crypto Direction — Trainer & Dashboard")
 
+# Build/version banner to verify UI is up to date
+UI_VERSION = "v0.2.3 (live-eval + confidence filter)"
+try:
+    mtime = os.path.getmtime(__file__)
+    ts = pd.to_datetime(mtime, unit="s")
+    st.caption(f"UI build: {UI_VERSION} | ui_app.py last modified: {ts} UTC")
+except Exception:
+    st.caption(f"UI build: {UI_VERSION}")
+
 tabs = st.tabs(["Backtest", "Realtime (rich)"])
 
 # ----------------------------- Backtest tab -----------------------------
