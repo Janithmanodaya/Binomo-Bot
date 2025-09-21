@@ -96,7 +96,10 @@ with tabs[0]:
             ph_status = st.empty()
             ph_metrics = st.empty()
             ph_table = st.empty()
+            ph_trades = st.empty()
             rows: List[Dict] = []
+            trade_rows: List[Dict] = []
+            pending_trade: Optional[Dict] = None
 
             for i in range(int(rt_minutes)):
                 # Fetch recent candles (limit 800) without 'since' to get the freshest bars
@@ -134,12 +137,24 @@ with tabs[0]:
                     confidence = 0.0
                 signal = int(1 if prob_up > threshold else (-1 if prob_up < 1 - threshold else 0))
 
-                # Track row; eligibility will be set after evaluation
+                # Track row and maybe open virtual trade
                 rows.append(dict(timestamp=ts, prob_up=prob_up, confidence=confidence, signal=signal))
                 df_rows = pd.DataFrame(rows)
                 ph_table.dataframe(df_rows.tail(50), use_container_width=True)
 
                 ph_status.info(f"[{i+1}/{int(rt_minutes)}] {ts} prob_up={prob_up:.4f} conf={confidence:.3f} signal={signal}")
+
+                eligible = (signal != 0) and (confidence >= min_conf)
+                entry_price = float(raw.loc[ts, "close"]) if ts in raw.index else np.nan
+                if eligible:
+                    side = "LONG" if signal == 1 else "SHORT"
+                    pending_trade = dict(
+                        entry_ts=ts,
+                        side=side,
+                        entry_price=entry_price,
+                        confidence=confidence,
+                        threshold=threshold,
+                    )
 
                 # Wait until next minute ends, then evaluate correctness
                 next_ts = (pd.Timestamp(ts).floor("T") + pd.Timedelta(minutes=1)).tz_convert("UTC")
@@ -169,13 +184,25 @@ with tabs[0]:
                         correct = bool(abs(next_ret) <= tau)
                         pnl = 0.0
 
-                    eligible = (signal != 0) and (confidence >= min_conf)
-
                     # Update last row with evaluation
                     rows[-1]["next_ret"] = next_ret
                     rows[-1]["correct"] = correct
                     rows[-1]["eligible"] = bool(eligible)
                     rows[-1]["pnl"] = pnl
+
+                    # If we opened a virtual trade, close and record it now
+                    if pending_trade is not None and bool(eligible):
+                        trade_rows.append(dict(
+                            entry_ts=str(pending_trade["entry_ts"]),
+                            side=pending_trade["side"],
+                            entry_price=float(pending_trade["entry_price"]),
+                            exit_ts=str(next_ts),
+                            exit_price=float(c1),
+                            confidence=float(pending_trade["confidence"]),
+                            result="WIN" if correct else "LOSS" if signal != 0 else "FLAT",
+                            pnl=float(pnl),
+                        ))
+                        pending_trade = None
 
                     # Build DataFrame and compute summary metrics
                     df_rows = pd.DataFrame(rows)
@@ -197,7 +224,10 @@ with tabs[0]:
                         mc3.metric("Cum PnL (eligible)", f"{cum_pnl:.3e}")
                         mc4.metric("All signals", f"{trades}")
 
-                    ph_table.dataframe(df_rows.tail(50), use_container_width=True)
+                    # Update trade log UI
+                    if trade_rows:
+                        df_tr = pd.DataFrame(trade_rows)
+                        ph_trades.dataframe(df_tr.tail(50), use_container_width=True)
 
             # Save preview to CSV
             os.makedirs("data/processed", exist_ok=True)
@@ -210,6 +240,16 @@ with tabs[0]:
                 file_name="realtime_preview.csv",
                 mime="text/csv",
             )
+            # Save trade log as well if any
+            if trade_rows:
+                out_trades = "data/processed/realtime_trades.csv"
+                pd.DataFrame(trade_rows).to_csv(out_trades, index=False)
+                st.download_button(
+                    "Download realtime_trades.csv",
+                    data=open(out_trades, "rb").read(),
+                    file_name="realtime_trades.csv",
+                    mime="text/csv",
+                )
         except Exception as e:
             st.error(f"Realtime preview error: {e}")
 
@@ -260,7 +300,10 @@ with tabs[1]:
             ph_status = st.empty()
             ph_metrics = st.empty()
             ph_table = st.empty()
+            ph_trades = st.empty()
             rows: List[Dict] = []
+            trade_rows: List[Dict] = []
+            pending_trade: Optional[Dict] = None
 
             for i in range(int(adv_minutes)):
                 ts, prob_up, signal, confidence = predict_latest(adv_symbol, feature_minutes=1200, bundle=bundle)
@@ -271,14 +314,31 @@ with tabs[1]:
                 ph_table.dataframe(df_rows.tail(50), use_container_width=True)
                 ph_status.info(f"[{i+1}/{int(adv_minutes)}] {ts} prob_up={prob_up:.4f} conf={confidence:.3f} signal={signal_str}")
 
+                # Decide eligibility and potentially open a virtual position
+                eligible = (signal != 0) and (confidence >= adv_min_conf)
+                # Fetch immediate entry price from exchange for accuracy
+                import ccxt
+                ex = ccxt.binance({"enableRateLimit": True})
+                raw_rows = ex.fetch_ohlcv(adv_symbol, timeframe="1m", limit=5)
+                raw = pd.DataFrame(raw_rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                raw["timestamp"] = pd.to_datetime(raw["timestamp"], unit="ms", utc=True)
+                raw = raw.set_index("timestamp").sort_index().drop_duplicates()
+                entry_price = float(raw.loc[ts, "close"]) if ts in raw.index else np.nan
+                if eligible:
+                    side = "LONG" if signal > 0 else "SHORT"
+                    pending_trade = dict(
+                        entry_ts=ts,
+                        side=side,
+                        entry_price=entry_price,
+                        confidence=confidence,
+                    )
+
                 # Wait for next bar and evaluate correctness vs cost-aware threshold
                 next_ts = (pd.Timestamp(ts).floor("T") + pd.Timedelta(minutes=1)).tz_convert("UTC")
                 sleep_s = max(2.0, (next_ts - pd.Timestamp.now(tz="UTC")).total_seconds() + 2.0)
                 time.sleep(sleep_s)
 
                 # Evaluate
-                import ccxt
-                ex = ccxt.binance({"enableRateLimit": True})
                 raw2_rows = ex.fetch_ohlcv(adv_symbol, timeframe="1m", limit=5)
                 raw2 = pd.DataFrame(raw2_rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
                 raw2["timestamp"] = pd.to_datetime(raw2["timestamp"], unit="ms", utc=True)
@@ -302,12 +362,26 @@ with tabs[1]:
                         correct = bool(abs(next_ret) <= tau)
                         pnl = 0.0
 
-                    eligible = (signal != 0) and (confidence >= adv_min_conf)
                     rows[-1]["next_ret"] = next_ret
                     rows[-1]["correct"] = correct
                     rows[-1]["eligible"] = bool(eligible)
                     rows[-1]["pnl"] = pnl
 
+                    # Close pending trade if opened
+                    if pending_trade is not None and bool(eligible):
+                        trade_rows.append(dict(
+                            entry_ts=str(pending_trade["entry_ts"]),
+                            side=pending_trade["side"],
+                            entry_price=float(pending_trade["entry_price"]),
+                            exit_ts=str(next_ts),
+                            exit_price=float(c1),
+                            confidence=float(pending_trade["confidence"]),
+                            result="WIN" if correct else "LOSS" if signal != 0 else "FLAT",
+                            pnl=float(pnl),
+                        ))
+                        pending_trade = None
+
+                    # Build DataFrame and compute summary metrics
                     df_rows = pd.DataFrame(rows)
                     if "eligible" in df_rows.columns:
                         df_elig = df_rows[df_rows["eligible"] == True]
@@ -327,7 +401,10 @@ with tabs[1]:
                         mc3.metric("Cum PnL (eligible)", f"{cum_pnl:.3e}")
                         mc4.metric("All signals", f"{trades}")
 
-                    ph_table.dataframe(df_rows.tail(50), use_container_width=True)
+                    # Update trade log UI
+                    if trade_rows:
+                        df_tr = pd.DataFrame(trade_rows)
+                        ph_trades.dataframe(df_tr.tail(50), use_container_width=True)
 
             # Save preview to CSV
             os.makedirs("data/processed", exist_ok=True)
@@ -340,5 +417,14 @@ with tabs[1]:
                 file_name="advanced_preview.csv",
                 mime="text/csv",
             )
+            if trade_rows:
+                out_trades = "data/processed/advanced_trades.csv"
+                pd.DataFrame(trade_rows).to_csv(out_trades, index=False)
+                st.download_button(
+                    "Download advanced_trades.csv",
+                    data=open(out_trades, "rb").read(),
+                    file_name="advanced_trades.csv",
+                    mime="text/csv",
+                )
         except Exception as e:
             st.error(f"Advanced preview error: {e}")
