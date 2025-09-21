@@ -478,8 +478,17 @@ class LiveApp(tk.Tk):
                     feature_minutes=int(self.live_feat_minutes.get()),
                     bundle=bundle,
                 )
-                # Map strength to signal {-1,0,1}
-                sig = int(1 if signal_strength > 0 else (-1 if signal_strength < 0 else 0))
+                # Map probability to signal using decision threshold and derive confidence
+                short_thr = 1.0 - thr
+                if prob_up >= thr:
+                    sig = 1
+                    conf = max(0.0, min(1.0, (prob_up - thr) / (1.0 - thr)))
+                elif prob_up <= short_thr:
+                    sig = -1
+                    conf = max(0.0, min(1.0, (short_thr - prob_up) / (1.0 - thr)))
+                else:
+                    sig = 0
+                    conf = 0.0
 
                 # Emit prediction
                 ts_local_str = str(pd.Timestamp(ts).tz_convert("Asia/Colombo"))
@@ -487,7 +496,7 @@ class LiveApp(tk.Tk):
                     "event": "prediction",
                     "timestamp": ts_local_str,
                     "prob_up": prob_up,
-                    "confidence": confidence,
+                    "confidence": conf,
                     "signal": sig,
                     "threshold": thr,
                 })
