@@ -127,14 +127,116 @@ def _confidence_from_probs(prob_vec: np.ndarray, threshold: float) -> Tuple[floa
     return float(p_up), 0, 0.0
 
 
+def _sample_params(rng: np.random.RandomState, class_weight_list: List[float]) -> Dict:
+    """Randomly sample a reasonable LightGBM parameter set."""
+    return dict(
+        objective="multiclass",
+        num_class=5,
+        metric=["multi_logloss"],
+        boosting_type="gbdt",
+        num_leaves=int(rng.randint(64, 256)),
+        learning_rate=float(10 ** rng.uniform(-2.0, -1.2)),  # ~[0.01, 0.063]
+        feature_fraction=float(rng.uniform(0.6, 0.95)),
+        bagging_fraction=float(rng.uniform(0.6, 0.95)),
+        bagging_freq=int(rng.randint(1, 6)),
+        min_data_in_leaf=int(rng.randint(50, 400)),
+        max_depth=int(rng.choice([-1, 8, 10, 12])),
+        lambda_l1=float(10 ** rng.uniform(-3.0, 1.0)),  # [0.001, 10]
+        lambda_l2=float(10 ** rng.uniform(-3.0, 1.0)),
+        min_gain_to_split=float(10 ** rng.uniform(-3.0, 0.7)),  # [0.001, 5]
+        verbose=-1,
+        seed=int(rng.randint(1, 10_000)),
+        class_weight=class_weight_list,
+        subsample=float(rng.uniform(0.6, 0.95)),  # alias for bagging_fraction in some builds
+        feature_pre_filter=False,  # allow dynamic min_data_in_leaf during HPO
+    )
+
+
+def _eval_model_pnl(
+    model: "lgb.Booster",
+    X_va: pd.DataFrame,
+    next_ret_va: pd.Series,
+    class_to_idx: Dict[int, int],
+    cost: CostModel,
+    min_confidence: float = 0.20,
+) -> Tuple[float, float]:
+    """
+    Return (best_threshold, mean_pnl) on validation using cost-aware pnl.
+
+    Uses CONDITIONAL p_up = P(up | non-flat) to match live logic and applies a
+    minimum confidence filter when generating trades during threshold search.
+    """
+    import lightgbm as lgb  # type: ignore
+
+    proba_va = model.predict(X_va, num_iteration=getattr(model, "best_iteration", None))
+    if proba_va is None or len(proba_va) == 0:
+        return 0.55, -1e9
+
+    # Extract class probabilities
+    p_down2 = proba_va[:, class_to_idx[-2]]
+    p_down1 = proba_va[:, class_to_idx[-1]]
+    p_up1 = proba_va[:, class_to_idx[1]]
+    p_up2 = proba_va[:, class_to_idx[2]]
+
+    p_up_raw = p_up1 + p_up2
+    p_down_raw = p_down1 + p_down2
+    p_nonflat = p_up_raw + p_down_raw
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        p_up_cond = np.where(p_nonflat > 1e-12, p_up_raw / p_nonflat, 0.5)
+        p_down_cond = np.where(p_nonflat > 1e-12, p_down_raw / p_nonflat, 0.5)
+
+    p_up_cond_s = pd.Series(p_up_cond, index=X_va.index)
+    p_down_cond_s = pd.Series(p_down_cond, index=X_va.index)
+    rt_cost = cost.roundtrip_cost_ret
+
+    thresholds = np.linspace(0.58, 0.82, 25)
+    best_t = 0.65
+    best_mean = -1e-9  # avoid selecting empty/flat by mistake
+
+    for t in thresholds:
+        # Decision masks
+        up_mask = p_up_cond_s >= t
+        down_mask = p_down_cond_s >= t
+
+        # Direction decision
+        signal = np.where(up_mask & (p_up_cond_s >= p_down_cond_s), 1, 0)
+        signal = np.where(down_mask & (p_down_cond_s > p_up_cond_s), -1, signal)
+
+        # Confidence
+        denom = max(1e-9, 1.0 - float(t))
+        conf_up = (p_up_cond_s.values - float(t)) / denom
+        conf_down = (p_down_cond_s.values - float(t)) / denom
+        conf = np.zeros_like(conf_up)
+        conf = np.where(signal == 1, conf_up, conf)
+        conf = np.where(signal == -1, conf_down, conf)
+
+        # Eligibility by confidence
+        eligible = conf >= float(min_confidence)
+        signal = np.where(eligible, signal, 0)
+
+        pnl = np.where(signal == 1, next_ret_va.values - rt_cost,
+                       np.where(signal == -1, -next_ret_va.values - rt_cost, 0.0))
+        mean_pnl = float(np.mean(pnl))
+        if mean_pnl > best_mean:
+            best_mean = mean_pnl
+            best_t = float(t)
+
+    return float(best_t), float(best_mean)
+
+
 def train_multilevel_model(
     symbol: str,
     days: int,
     cost: CostModel,
     progress: Optional[Callable[[str, float], None]] = None,
+    trials: int = 20,
+    backtest_days: int = 0,
 ) -> Tuple[str, str]:
     """
     Train a multi-level (5-class) LightGBM model and save to data/processed/.
+    Includes a small random search over hyperparameters to maximize validation PnL.
+    Optionally keeps the last `backtest_days` out-of-sample for a small backtest.
     Returns (model_path, meta_path).
     """
     def report(stage: str, p: float):
@@ -151,20 +253,37 @@ def train_multilevel_model(
 
     report("Labeling (multi-level)", 0.18)
     labeled = build_multi_level_labels(feats, cost)
-    X, y = feature_target_split(labeled)
+    X_all, y_all = feature_target_split(labeled)
 
     # Remove NaN labels
-    mask = y.notna()
-    X, y = X[mask], y[mask].astype(int)
+    mask_all = y_all.notna()
+    X_all, y_all = X_all[mask_all], y_all[mask_all].astype(int)
+    labeled = labeled.loc[X_all.index]
 
-    if len(X) < 5000:
+    if len(X_all) < 5000:
         raise RuntimeError("Not enough samples for advanced training. Increase days.")
 
-    # Train/validation split: last 15% for threshold tuning
-    split = int(len(X) * 0.85)
-    X_tr, y_tr = X.iloc[:split], y.iloc[:split]
-    X_va, y_va = X.iloc[split:], y.iloc[split:]
-    next_ret_va = labeled.iloc[split:]["next_ret"]
+    # Split out backtest window if requested
+    if backtest_days and backtest_days > 0:
+        bt_cut = labeled.index.max() - pd.Timedelta(days=int(backtest_days))
+        back_mask = labeled.index >= bt_cut
+    else:
+        back_mask = pd.Series(False, index=labeled.index)
+
+    # Train/validation split (on the non-backtest subset): last 15% for threshold tuning
+    idx_train_val = labeled.index[~back_mask]
+    n_tv = len(idx_train_val)
+    if n_tv < 2000:
+        raise RuntimeError("Not enough samples after excluding backtest for training/validation.")
+
+    split = int(n_tv * 0.85)
+    tv_idx_sorted = idx_train_val.sort_values()
+    idx_tr = tv_idx_sorted[:split]
+    idx_va = tv_idx_sorted[split:]
+
+    X_tr, y_tr = X_all.loc[idx_tr], y_all.loc[idx_tr]
+    X_va, y_va = X_all.loc[idx_va], y_all.loc[idx_va]
+    next_ret_va = labeled.loc[idx_va, "next_ret"]
 
     classes = [-2, -1, 0, 1, 2]
     class_to_idx = {c: i for i, c in enumerate(classes)}
@@ -173,61 +292,136 @@ def train_multilevel_model(
 
     # Class weights to handle imbalance
     cw = _class_weights(y_tr, classes)
-    # Convert to LightGBM format: list weights by class index order
     class_weight_list = [cw[c] for c in classes]
 
     import lightgbm as lgb
     dtrain = lgb.Dataset(X_tr, label=y_tr_idx)
     dval = lgb.Dataset(X_va, label=y_va_idx)
 
-    params = dict(
-        objective="multiclass",
-        num_class=5,
-        metric=["multi_logloss"],
-        boosting_type="gbdt",
-        num_leaves=128,
-        learning_rate=0.03,
-        feature_fraction=0.85,
-        bagging_fraction=0.8,
-        bagging_freq=1,
-        min_data_in_leaf=200,
-        verbose=-1,
-        seed=42,
-        class_weight=class_weight_list,
-    )
-    report("Training model", 0.22)
-    model = lgb.train(
-        params,
-        dtrain,
-        num_boost_round=5000,
-        valid_sets=[dtrain, dval],
-        valid_names=["train", "valid"],
-        callbacks=[
-            lgb.early_stopping(stopping_rounds=250, verbose=False),
-            lgb.log_evaluation(period=200),
-        ],
-    )
-    report("Tuning threshold", 0.80)
+    # Random search over params to maximize validation mean PnL
+    report("Hyperparameter search", 0.22)
+    rng = np.random.RandomState(42)
+    best_model = None
+    best_thr = 0.55
+    best_mean_pnl = -1e9
 
-    # Build p_up series for validation to tune threshold
-    proba_va = model.predict(X_va, num_iteration=model.best_iteration)  # shape [N,5]
-    proba_up = proba_va[:, class_to_idx[1]] + proba_va[:, class_to_idx[2]]
-    proba_up_s = pd.Series(proba_up, index=X_va.index)
-    threshold = tune_threshold_for_pnl(proba_up_s, next_ret_va.loc[proba_up_s.index], cost)
+    trials = int(max(1, trials))
+    for i in range(trials):
+        params = _sample_params(rng, class_weight_list)
+        model = lgb.train(
+            params,
+            dtrain,
+            num_boost_round=4000,
+            valid_sets=[dtrain, dval],
+            valid_names=["train", "valid"],
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=200, verbose=False),
+            ],
+        )
+        thr, mean_pnl = _eval_model_pnl(model, X_va, next_ret_va, class_to_idx, cost, min_confidence=0.20)
+        if mean_pnl > best_mean_pnl:
+            best_mean_pnl = mean_pnl
+            best_model = model
+            best_thr = thr
+        if progress:
+            progress(f"Hyperparameter search ({i+1}/{trials})", 0.22 + 0.5 * (i + 1) / trials)
 
-    report("Saving model", 0.92)
+    if best_model is None:
+        # Fallback default
+        params = dict(
+            objective="multiclass",
+            num_class=5,
+            metric=["multi_logloss"],
+            boosting_type="gbdt",
+            num_leaves=128,
+            learning_rate=0.03,
+            feature_fraction=0.85,
+            bagging_fraction=0.8,
+            bagging_freq=1,
+            min_data_in_leaf=200,
+            verbose=-1,
+            seed=42,
+            class_weight=class_weight_list,
+        )
+        best_model = lgb.train(
+            params,
+            dtrain,
+            num_boost_round=3000,
+            valid_sets=[dtrain, dval],
+            valid_names=["train", "valid"],
+            callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)],
+        )
+        best_thr, best_mean_pnl = _eval_model_pnl(best_model, X_va, next_ret_va, class_to_idx, cost, min_confidence=0.20)
+
+
+    # Optional small backtest on held-out last `backtest_days`
+    backtest_metrics: Dict[str, float] = {}
+    if back_mask.any():
+        report("Backtesting (holdout)", 0.75)
+        idx_bt = labeled.index[back_mask]
+        X_bt = X_all.loc[idx_bt]
+        next_ret_bt = labeled.loc[idx_bt, "next_ret"]
+        proba_bt = best_model.predict(X_bt, num_iteration=getattr(best_model, "best_iteration", None))
+
+        # Compute CONDITIONAL p_up for backtest to match live logic
+        p_down2_bt = proba_bt[:, class_to_idx[-2]]
+        p_down1_bt = proba_bt[:, class_to_idx[-1]]
+        p_flat_bt  = proba_bt[:, class_to_idx[0]]
+        p_up1_bt   = proba_bt[:, class_to_idx[1]]
+        p_up2_bt   = proba_bt[:, class_to_idx[2]]
+
+        p_up_raw_bt = p_up1_bt + p_up2_bt
+        p_down_raw_bt = p_down1_bt + p_down2_bt
+        p_nonflat_bt = p_up_raw_bt + p_down_raw_bt
+        with np.errstate(divide="ignore", invalid="ignore"):
+            p_up_cond_bt = np.where(p_nonflat_bt > 1e-12, p_up_raw_bt / p_nonflat_bt, 0.5)
+
+        p_up_bt_s = pd.Series(p_up_cond_bt, index=idx_bt)
+        t = float(best_thr)
+        rt_cost = cost.roundtrip_cost_ret
+        signal_bt = np.where(p_up_bt_s > t, 1, np.where(p_up_bt_s < 1 - t, -1, 0))
+        pnl_bt = np.where(signal_bt == 1, next_ret_bt - rt_cost, np.where(signal_bt == -1, -next_ret_bt - rt_cost, 0.0))
+        df_bt = pd.DataFrame(
+            {"prob_up": p_up_bt_s, "signal": signal_bt, "next_ret": next_ret_bt, "pnl": pnl_bt},
+            index=idx_bt,
+        )
+        os.makedirs("data/processed", exist_ok=True)
+        df_bt.to_csv("data/processed/advanced_backtest.csv", index_label="timestamp")
+
+        trades = int((df_bt["signal"] != 0).sum())
+        wins = int(((df_bt["signal"] == 1) & (df_bt["next_ret"] > rt_cost)).sum() + ((df_bt["signal"] == -1) & (df_bt["next_ret"] < -rt_cost)).sum())
+        win_rate = float(wins / trades) if trades > 0 else 0.0
+        cum_pnl = float(df_bt["pnl"].sum())
+        expectancy = float(df_bt["pnl"].mean())
+        backtest_metrics = dict(
+            trades=trades,
+            win_rate=win_rate,
+            cum_pnl=cum_pnl,
+            expectancy=expectancy,
+            days=int(backtest_days),
+        )
+
+    report("Finalizing model", 0.80)
+
+    # Save model and metadata
     model_path = "data/processed/advanced_model.txt"
     meta_path = "data/processed/advanced_meta.json"
-    model.save_model(model_path)
+    best_model.save_model(model_path)
     meta = AdvancedMeta(
         symbol=symbol,
-        feature_names=list(X.columns),
-        threshold=float(threshold),
+        feature_names=list(X_all.columns),
+        threshold=float(best_thr),
         taker_fee_bps=float(cost.taker_fee_bps),
         slippage_bps=float(cost.slippage_bps),
-        best_iteration=getattr(model, "best_iteration", None),
+        best_iteration=getattr(best_model, "best_iteration", None),
         classes=classes,
     ).__dict__
+    # Add extras
+    meta["trials"] = int(trials)
+    if back_mask.any():
+        meta["backtest_days"] = int(backtest_days)
+        meta["backtest_metrics"] = backtest_metrics
+
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 

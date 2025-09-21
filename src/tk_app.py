@@ -78,6 +78,12 @@ class LiveApp(tk.Tk):
         self.live_feat_minutes = tk.IntVar(value=2000)
         self.live_default_thresh = tk.DoubleVar(value=0.55)
 
+        # Advanced training controls
+        self.adv_trials_var = tk.IntVar(value=20)
+        self.adv_backtest_days_var = tk.IntVar(value=7)
+        # Advanced live overrides
+        self.adv_threshold_var = tk.DoubleVar(value=0.00)  # 0 -> use meta threshold
+
         self.model_type = tk.StringVar(value="Advanced")  # "Basic" or "Advanced"
 
         def add_row(parent, r, label, widget):
@@ -93,6 +99,17 @@ class LiveApp(tk.Tk):
         add_row(cfg, 5, "Feature minutes (recent):", ttk.Spinbox(cfg, from_=500, to=5000, increment=100, textvariable=self.live_feat_minutes))
         add_row(cfg, 6, "Default decision threshold:", ttk.Spinbox(cfg, from_=0.50, to=0.90, increment=0.01, textvariable=self.live_default_thresh))
         add_row(cfg, 7, "Min confidence (virtual trade):", ttk.Spinbox(cfg, from_=0.00, to=1.00, increment=0.01, textvariable=self._min_conf_var))
+        # Break out widget creation to avoid very long argument lists on one line
+        spin_trials = ttk.Spinbox(cfg, from_=1, to=200, increment=1, textvariable=self.adv_trials_var)
+        add_row(cfg, 8, "Advanced trials (HPO):", spin_trials)
+
+        spin_bt_days = ttk.Spinbox(cfg, from_=0, to=60, increment=1, textvariable=self.adv_backtest_days_var)
+        add_row(cfg, 9, "Backtest holdout days:", spin_bt_days)
+
+        spin_thr = ttk.Spinbox(cfg, from_=0.00, to=0.90, increment=0.01, textvariable=self.adv_threshold_var)
+        add_row(cfg, 10, "Advanced live threshold (0=auto):", spin_thr)
+        add_row(cfg, 9, "Backtest holdout days:", ttk.Spinbox(cfg, from_=0, to=60, increment=1, textvariable=self.adv_backtest_days_var))
+        add_row(cfg, 10, "Advanced live threshold (0=auto):", ttk.Spinbox(cfg, from_=0.00, to=0.90, increment=0.01, textvariable=self.adv_threshold_v_codearnew)</)
 
         # Controls
         btns = ttk.Frame(frm)
@@ -159,8 +176,18 @@ class LiveApp(tk.Tk):
             self.trades_view.column(c, width=110, anchor="center")
         self.trades_view.pack(fill=tk.BOTH, expand=True)
 
+        # Backtest summary table
+        backtestf = ttk.LabelFrame(lower, text="Backtest summary", padding=6)
+        bt_cols = ("days", "trades", "win_rate", "cum_pnl", "expectancy")
+        self.backtest_view = ttk.Treeview(backtestf, columns=bt_cols, show="headings", height=6)
+        for c in bt_cols:
+            self.backtest_view.heading(c, text=c)
+            self.backtest_view.column(c, width=110, anchor="center")
+        self.backtest_view.pack(fill=tk.BOTH, expand=True)
+
         lower.add(live_logf, weight=1)
         lower.add(tradesf, weight=1)
+        lower.add(backtestf, weight=0)
 
     # ---------------- Helpers ----------------
     def _append_live_log(self, text: str):
@@ -174,36 +201,73 @@ class LiveApp(tk.Tk):
         return ts.tz_convert("UTC")
 
     def _fetch_prices_for_ts(self, symbol: str, ts_utc: pd.Timestamp) -> Optional[Dict[str, float]]:
+        """
+        Robustly fetch entry (c0) and next (c1) close prices for a given UTC minute.
+        Tries an anchored fetch using 'since' to guarantee inclusion of the desired candles,
+        and falls back to a larger recent window if needed.
+        """
         try:
             import ccxt
             ex = ccxt.binance({"enableRateLimit": True})
-            raw = ex.fetch_ohlcv(symbol, timeframe="1m", limit=5)
-            df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-            df = df.set_index("timestamp").sort_index().drop_duplicates()
+            ts_utc = pd.Timestamp(ts_utc).tz_convert("UTC")
             next_ts = (ts_utc.floor("T") + pd.Timedelta(minutes=1)).tz_convert("UTC")
-            if ts_utc in df.index and next_ts in df.index:
-                return {"c0": float(df.loc[ts_utc, "close"]), "c1": float(df.loc[next_ts, "close"])}
+
+            # 1) Try anchored fetch around the target minute
+            since_ms = int((ts_utc - pd.Timedelta(minutes=2)).timestamp() * 1000)
+            try:
+                raw = ex.fetch_ohlcv(symbol, timeframe="1m", since=since_ms, limit=10)
+            except Exception:
+                raw = []
+
+            def to_df(rows):
+                df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+                df = df.set_index("timestamp").sort_index().drop_duplicates()
+                return df
+
+            ok = False
+            if raw:
+                df = to_df(raw)
+                if (ts_utc in df.index) and (next_ts in df.index):
+                    ok = True
+                    return {"c0": float(df.loc[ts_utc, "close"]), "c1": float(df.loc[next_ts, "close"])}
+
+            # 2) Fallback: fetch a larger recent window
+            if not ok:
+                raw2 = ex.fetch_ohlcv(symbol, timeframe="1m", limit=120)
+                if raw2:
+                    df2 = to_df(raw2)
+                    if (ts_utc in df2.index) and (next_ts in df2.index):
+                        return {"c0": float(df2.loc[ts_utc, "close"]), "c1": float(df2.loc[next_ts, "close"])}
+
         except Exception:
-            return None
+            pass
         return None
 
     def _maybe_open_virtual_trade(self, symbol: str, signal: int, confidence: float, ts_local_str: str):
+        """
+        Open a virtual trade only if we can reliably resolve entry and next prices
+        for the prediction timestamp. Otherwise skip and log.
+        """
         try:
             if signal == 0 or confidence < float(self._min_conf_var.get()):
                 return
             ts_utc = self._to_utc_from_local_str(ts_local_str)
             prices = self._fetch_prices_for_ts(symbol, ts_utc)
-            entry_price = prices["c0"] if prices else float("nan")
+            if not prices:
+                # Could not fetch matching candles; skip opening this trade
+                self._append_live_log(f"Warning: could not resolve entry price for {ts_local_str}; skipping virtual trade.\n")
+                return
+            entry_price = float(prices["c0"])
             side = "LONG" if signal == 1 else "SHORT"
             self._pending_trade = dict(
                 entry_ts=ts_local_str,
                 side=side,
-                entry_price=float(entry_price),
+                entry_price=entry_price,
                 confidence=float(confidence),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            self._append_live_log(f"Virtual trade open error: {e}\n")
 
     def _close_virtual_trade(self, symbol: str, ts_local_str: str, correct: Optional[bool] = None):
         if not self._pending_trade:
@@ -274,15 +338,49 @@ class LiveApp(tk.Tk):
                 self._update_train_progress(stage, p)
                 self.live_status.set(stage)
             self._update_train_progress("Starting training", 0.0)
-            train_multilevel_model(symbol, days, cost, progress=on_prog)
+            train_multilevel_model(
+                symbol,
+                days,
+                cost,
+                progress=on_prog,
+                trials=int(self.adv_trials_var.get()),
+                backtest_days=int(self.adv_backtest_days_var.get()),
+            )
             self._adv_bundle = load_advanced_bundle()
             if self._adv_bundle is None:
                 raise RuntimeError("Advanced model files not found after training.")
-            thr = float(self._adv_bundle["meta"].get("threshold", float(self.live_default_thresh.get())))
+            meta = self._adv_bundle["meta"]
+            thr = float(meta.get("threshold", float(self.live_default_thresh.get())))
             self.train_progress["value"] = 100
             self.train_status.set("Training complete")
             self.live_status.set(f"Model ready (threshold={thr:.2f})")
-            self._append_live_log("Advanced model trained and loaded.\n")
+            # Log backtest metrics if present and update table
+            bt = meta.get("backtest_metrics")
+            # Clear backtest table
+            try:
+                for item in self.backtest_view.get_children():
+                    self.backtest_view.delete(item)
+            except Exception:
+                pass
+            if bt:
+                self._append_live_log(
+                    "Advanced model trained and loaded.\n"
+                    f"- Backtest ({bt.get('days', 0)} days): trades={bt.get('trades', 0)}, "
+                    f"win_rate={bt.get('win_rate', 0.0):.3f}, cum_pnl={bt.get('cum_pnl', 0.0):.3e}, "
+                    f"expectancy={bt.get('expectancy', 0.0):.3e}\n"
+                )
+                try:
+                    self.backtest_view.insert("", tk.END, values=(
+                        bt.get("days", 0),
+                        bt.get("trades", 0),
+                        f"{bt.get('win_rate', 0.0):.3f}",
+                        f"{bt.get('cum_pnl', 0.0):.3e}",
+                        f"{bt.get('expectancy', 0.0):.3e}",
+                    ))
+                except Exception:
+                    pass
+            else:
+                self._append_live_log("Advanced model trained and loaded.\n")
         except Exception as e:
             messagebox.showerror("Advanced Training", str(e))
             self._append_live_log(f"Advanced training error: {e}\n")
@@ -313,6 +411,24 @@ class LiveApp(tk.Tk):
             thr = float(meta.get("threshold", float(self.live_default_thresh.get())))
             self.live_status.set(f"Loaded model (threshold={thr:.2f})")
             self._append_live_log(f"Loaded model:\n- model: {model_path}\n- meta: {meta_path}\n")
+            # Populate backtest summary table if available
+            bt = meta.get("backtest_metrics")
+            try:
+                for item in self.backtest_view.get_children():
+                    self.backtest_view.delete(item)
+            except Exception:
+                pass
+            if bt:
+                try:
+                    self.backtest_view.insert("", tk.END, values=(
+                        bt.get("days", 0),
+                        bt.get("trades", 0),
+                        f"{bt.get('win_rate', 0.0):.3f}",
+                        f"{bt.get('cum_pnl', 0.0):.3e}",
+                        f"{bt.get('expectancy', 0.0):.3e}",
+                    ))
+                except Exception:
+                    pass
         except Exception as e:
             messagebox.showerror("Load Model", str(e))
 
@@ -451,7 +567,14 @@ class LiveApp(tk.Tk):
 
                 self._update_train_progress("Starting training", 0.0)
                 try:
-                    train_multilevel_model(symbol, days, cost, progress=on_prog)
+                    train_multilevel_model(
+                        symbol,
+                        days,
+                        cost,
+                        progress=on_prog,
+                        trials=int(self.adv_trials_var.get()),
+                        backtest_days=int(self.adv_backtest_days_var.get()),
+                    )
                 except Exception as e:
                     self._append_live_log(f"Advanced training error: {e}\n")
                     self.live_status.set("Training error")
@@ -468,27 +591,46 @@ class LiveApp(tk.Tk):
                 self._append_live_log("Using loaded advanced model bundle.\n")
 
             bundle = self._adv_bundle
-            thr = float(bundle["meta"].get("threshold", float(self.live_default_thresh.get())))
+            meta = bundle["meta"]
+            thr = float(meta.get("threshold", float(self.live_default_thresh.get())))
             self.live_status.set(f"Model ready (threshold={thr:.2f})")
+            bt = meta.get("backtest_metrics")
+            # Clear and update backtest table
+            try:
+                for item in self.backtest_view.get_children():
+                    self.backtest_view.delete(item)
+            except Exception:
+                pass
+            if bt:
+                self._append_live_log(
+                    f"Backtest ({bt.get('days', 0)} days): trades={bt.get('trades', 0)}, "
+                    f"win_rate={bt.get('win_rate', 0.0):.3f}, cum_pnl={bt.get('cum_pnl', 0.0):.3e}, "
+                    f"expectancy={bt.get('expectancy', 0.0):.3e}\n"
+                )
+                try:
+                    self.backtest_view.insert("", tk.END, values=(
+                        bt.get("days", 0),
+                        bt.get("trades", 0),
+                        f"{bt.get('win_rate', 0.0):.3f}",
+                        f"{bt.get('cum_pnl', 0.0):.3e}",
+                        f"{bt.get('expectancy', 0.0):.3e}",
+                    ))
+                except Exception:
+                    pass
 
             # Live prediction loop
             while not self._stop_event.is_set():
-                ts, prob_up, signal_strength, confidence = adv_predict_latest(
+                thr_override = float(self.adv_threshold_var.get())
+                ts, prob_up, strength, conf = adv_predict_latest(
                     symbol=symbol,
                     feature_minutes=int(self.live_feat_minutes.get()),
                     bundle=bundle,
+                    threshold_override=thr_override if thr_override > 0.0 else None,
                 )
-                # Map probability to signal using decision threshold and derive confidence
-                short_thr = 1.0 - thr
-                if prob_up >= thr:
-                    sig = 1
-                    conf = max(0.0, min(1.0, (prob_up - thr) / (1.0 - thr)))
-                elif prob_up <= short_thr:
-                    sig = -1
-                    conf = max(0.0, min(1.0, (short_thr - prob_up) / (1.0 - thr)))
-                else:
-                    sig = 0
-                    conf = 0.0
+                # Use the advanced model's strength and confidence directly.
+                # strength ∈ {-2,-1,0,1,2} -> directional signal {-1,0,1}
+                sig = 1 if int(strength) > 0 else (-1 if int(strength) < 0 else 0)
+                conf = float(conf)
 
                 # Emit prediction
                 ts_local_str = str(pd.Timestamp(ts).tz_convert("Asia/Colombo"))

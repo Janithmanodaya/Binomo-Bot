@@ -149,52 +149,15 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> 
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute a compact set of cost-aware minute features.
-    All features use only information available at or before t.
+    Build features for training/prediction.
+
+    This wraps the technical-indicator rich feature set so that all training
+    pipelines (and any consumer importing build_features from run_pipeline)
+    will use the extended TA + multi-timeframe features.
     """
-    out = df.copy()
-    out["ret_1"] = np.log(out["close"]).diff()
-    out["ret_3"] = out["ret_1"].rolling(3).sum()
-    out["ret_5"] = out["ret_1"].rolling(5).sum()
-    out["vol_5"] = out["ret_1"].rolling(5).std()
-    out["vol_15"] = out["ret_1"].rolling(15).std()
-
-    out["ema_3"] = ema(out["close"], 3)
-    out["ema_9"] = ema(out["close"], 9)
-    out["ema_21"] = ema(out["close"], 21)
-    out["ema_3_delta"] = out["ema_3"] / out["close"] - 1.0
-    out["ema_9_delta"] = out["ema_9"] / out["close"] - 1.0
-    out["ema_21_delta"] = out["ema_21"] / out["close"] - 1.0
-
-    out["rsi_14"] = rsi(out["close"], 14)
-    out["atr_14"] = atr(out["high"], out["low"], out["close"], 14) / out["close"]
-
-    # Candle shape features
-    body = (out["close"] - out["open"]).abs()
-    range_ = (out["high"] - out["low"]).replace(0, np.nan)
-    out["candle_body_frac"] = (body / range_).fillna(0.0)
-    out["upper_wick_frac"] = ((out["high"] - out[["open", "close"]].max(axis=1)) / range_).clip(lower=0).fillna(0.0)
-    out["lower_wick_frac"] = (((out[["open", "close"]].min(axis=1)) - out["low"]) / range_).clip(lower=0).fillna(0.0)
-
-    # Temporal cyclic encodings
-    out["minute"] = out.index.minute
-    out["hour"] = out.index.hour
-    out["dow"] = out.index.dayofweek
-    out["minute_sin"] = np.sin(2 * np.pi * out["minute"] / 60.0)
-    out["minute_cos"] = np.cos(2 * np.pi * out["minute"] / 60.0)
-    out["hour_sin"] = np.sin(2 * np.pi * out["hour"] / 24.0)
-    out["hour_cos"] = np.cos(2 * np.pi * out["hour"] / 24.0)
-    out["dow_sin"] = np.sin(2 * np.pi * out["dow"] / 7.0)
-    out["dow_cos"] = np.cos(2 * np.pi * out["dow"] / 7.0)
-
-    # Rolling z-score normalize a subset
-    for col in ["ret_1", "ret_3", "ret_5"]:
-        mean = out[col].rolling(200).mean()
-        std = out[col].rolling(200).std().replace(0, np.nan)
-        out[col + "_z"] = ((out[col] - mean) / std).fillna(0.0)
-
-    out = out.dropna().copy()
-    return out
+    # Local import to avoid circular dependency at module import time.
+    from src.feature_lib import build_rich_features
+    return build_rich_features(df)
 
 
 # ----------------------------
