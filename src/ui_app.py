@@ -1,11 +1,11 @@
 import os
 import time
 from typing import Dict, List, Optional
-import numpy as np
 
+import numpy as np
 import pandas as pd
-import streamlit as st
 import plotly.express as px
+import streamlit as st
 
 # Ensure project root is on sys.path so `from src...` works when running as a script inside src/
 try:
@@ -26,6 +26,15 @@ import lightgbm as lgb  # type: ignore
 
 st.set_page_config(page_title="Crypto Baseline Trainer", layout="wide")
 st.title("Cost-aware 1m Crypto Direction — Trainer & Dashboard")
+
+# Build/version banner to verify UI is up to date
+UI_VERSION = "v0.2.3 (live-eval + confidence filter)"
+try:
+    mtime = os.path.getmtime(__file__)
+    ts = pd.to_datetime(mtime, unit="s")
+    st.caption(f"UI build: {UI_VERSION} | ui_app.py last modified: {ts} UTC")
+except Exception:
+    st.caption(f"UI build: {UI_VERSION}")
 
 tabs = st.tabs(["Backtest", "Realtime (rich)"])
 
@@ -130,11 +139,12 @@ with tabs[1]:
     colA, colB, colC = st.columns(3)
     rt_symbol = colA.text_input("Symbol", value="ETH/USDT", key="rt_symbol")
     rt_days = colB.number_input("Train lookback (days)", min_value=10, max_value=365, value=90, step=5, key="rt_days")
-    rt_minutes = colC.number_input("Preview minutes", min_value=1, max_value=120, value=10, step=1, key="rt_preview")
+    rt_minutes = colC.number_input("Preview minutes", min_value=1, max_value=240, value=10, step=1, key="rt_preview")
 
-    colD, colE = st.columns(2)
+    colD, colE, colF = st.columns(3)
     rt_fee = colD.number_input("Taker fee per side (bps)", min_value=0.0, max_value=50.0, value=4.0, step=0.5, key="rt_fee")
     rt_slip = colE.number_input("Slippage per side (bps)", min_value=0.0, max_value=50.0, value=1.0, step=0.5, key="rt_slip")
+    min_conf = float(colF.slider("Min confidence to count a trade", min_value=0.00, max_value=1.00, value=0.30, step=0.01, key="rt_min_conf"))
 
     train_btn = st.button("Train/Refresh realtime model", key="rt_train")
     run_preview_btn = st.button("Run realtime preview", type="primary", key="rt_run")
@@ -177,8 +187,9 @@ with tabs[1]:
 
             st.info(f"Using threshold={threshold:.2f}")
             ph_status = st.empty()
+            ph_metrics = st.empty()
             ph_table = st.empty()
-            rows = []
+            rows: List[Dict] = []
 
             for i in range(int(rt_minutes)):
                 # Fetch recent candles (limit 800) without 'since' to get the freshest bars
@@ -206,9 +217,17 @@ with tabs[1]:
                 X_row = X_row[feature_names] if feature_names else X_row
 
                 prob_up = float(booster.predict(X_row)[0])
-                confidence = float(2.0 * abs(prob_up - 0.5))  # [0,1]
+                # Decision-aware confidence in [0,1]
+                lo = 1.0 - threshold
+                if prob_up >= threshold:
+                    confidence = float(max(0.0, min(1.0, (prob_up - threshold) / (1.0 - threshold))))
+                elif prob_up <= lo:
+                    confidence = float(max(0.0, min(1.0, (lo - prob_up) / (1.0 - threshold))))
+                else:
+                    confidence = 0.0
                 signal = int(1 if prob_up > threshold else (-1 if prob_up < 1 - threshold else 0))
 
+                # Track row; eligibility will be set after evaluation
                 rows.append(dict(timestamp=ts, prob_up=prob_up, confidence=confidence, signal=signal))
                 df_rows = pd.DataFrame(rows)
                 ph_table.dataframe(df_rows.tail(50), use_container_width=True)
@@ -217,7 +236,7 @@ with tabs[1]:
 
                 # Wait until next minute ends, then evaluate correctness
                 next_ts = (pd.Timestamp(ts).floor("T") + pd.Timedelta(minutes=1)).tz_convert("UTC")
-                sleep_s = max(2.0, (next_ts - pd.Timestamp.now(tz=\"UTC\")).total_seconds() + 2.0)
+                sleep_s = max(2.0, (next_ts - pd.Timestamp.now(tz="UTC")).total_seconds() + 2.0)
                 time.sleep(sleep_s)
 
                 # Refresh small window to evaluate
@@ -226,21 +245,51 @@ with tabs[1]:
                 raw2["timestamp"] = pd.to_datetime(raw2["timestamp"], unit="ms", utc=True)
                 raw2 = raw2.set_index("timestamp").sort_index().drop_duplicates()
 
-                correct = None
-                if ts in raw2.index and next_ts in raw2.index:
+                # Evaluate correctness and update live metrics/table
+                if (ts in raw2.index) and (next_ts in raw2.index):
                     c0 = float(raw2.loc[ts, "close"])
                     c1 = float(raw2.loc[next_ts, "close"])
-                    next_ret = float(np.log(c1) - np.log(c0))  # type: ignore[name-defined]
+                    next_ret = float(np.log(c1) - np.log(c0))
                     tau = cost.roundtrip_cost_ret
+
                     if signal == 1:
-                        correct = next_ret > tau
+                        correct = bool(next_ret > tau)
+                        pnl = float(next_ret - tau)
                     elif signal == -1:
-                        correct = next_ret < -tau
+                        correct = bool(next_ret < -tau)
+                        pnl = float(-next_ret - tau)
                     else:
-                        correct = abs(next_ret) <= tau
+                        correct = bool(abs(next_ret) <= tau)
+                        pnl = 0.0
+
+                    eligible = (signal != 0) and (confidence >= min_conf)
+
+                    # Update last row with evaluation
                     rows[-1]["next_ret"] = next_ret
-                    rows[-1]["correct"] = bool(correct)
+                    rows[-1]["correct"] = correct
+                    rows[-1]["eligible"] = bool(eligible)
+                    rows[-1]["pnl"] = pnl
+
+                    # Build DataFrame and compute summary metrics
                     df_rows = pd.DataFrame(rows)
+                    if "eligible" in df_rows.columns:
+                        df_elig = df_rows[df_rows["eligible"] == True]
+                    else:
+                        df_elig = pd.DataFrame(columns=df_rows.columns)
+
+                    trades = int((df_rows["signal"] != 0).sum()) if "signal" in df_rows.columns else 0
+                    elig_trades = int(len(df_elig))
+                    wins = int(df_elig["correct"].sum()) if ("correct" in df_elig.columns and elig_trades > 0) else 0
+                    win_rate = (wins / elig_trades) if elig_trades > 0 else 0.0
+                    cum_pnl = float(df_elig["pnl"].sum()) if ("pnl" in df_elig.columns and elig_trades > 0) else 0.0
+
+                    with ph_metrics.container():
+                        mc1, mc2, mc3, mc4 = st.columns(4)
+                        mc1.metric("Eligible trades", f"{elig_trades}")
+                        mc2.metric("Win rate (eligible)", f"{win_rate * 100:.1f}%")
+                        mc3.metric("Cum PnL (eligible)", f"{cum_pnl:.3e}")
+                        mc4.metric("All signals", f"{trades}")
+
                     ph_table.dataframe(df_rows.tail(50), use_container_width=True)
 
             # Save preview to CSV
