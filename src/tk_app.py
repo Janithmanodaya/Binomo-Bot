@@ -8,6 +8,9 @@ from typing import Dict, Optional, Callable
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
+# Live components
+from src.live_signal import LiveConfig, LiveSignalRunner  # type: ignore
+
 # Ensure project root is on sys.path so `from src...` works regardless of CWD
 try:
     from src.run_pipeline import (
