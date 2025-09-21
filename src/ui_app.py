@@ -130,11 +130,12 @@ with tabs[1]:
     colA, colB, colC = st.columns(3)
     rt_symbol = colA.text_input("Symbol", value="ETH/USDT", key="rt_symbol")
     rt_days = colB.number_input("Train lookback (days)", min_value=10, max_value=365, value=90, step=5, key="rt_days")
-    rt_minutes = colC.number_input("Preview minutes", min_value=1, max_value=120, value=10, step=1, key="rt_preview")
+    rt_minutes = colC.number_input("Preview minutes", min_value=1, max_value=240, value=10, step=1, key="rt_preview")
 
-    colD, colE = st.columns(2)
+    colD, colE, colF = st.columns(3)
     rt_fee = colD.number_input("Taker fee per side (bps)", min_value=0.0, max_value=50.0, value=4.0, step=0.5, key="rt_fee")
     rt_slip = colE.number_input("Slippage per side (bps)", min_value=0.0, max_value=50.0, value=1.0, step=0.5, key="rt_slip")
+    min_conf = float(colF.slider("Min confidence to count a trade", min_value=0.00, max_value=1.00, value=0.30, step=0.01, key="rt_min_conf"))
 
     train_btn = st.button("Train/Refresh realtime model", key="rt_train")
     run_preview_btn = st.button("Run realtime preview", type="primary", key="rt_run")
@@ -177,6 +178,7 @@ with tabs[1]:
 
             st.info(f"Using threshold={threshold:.2f}")
             ph_status = st.empty()
+            ph_metrics = st.empty()
             ph_table = st.empty()
             rows = []
 
@@ -216,6 +218,7 @@ with tabs[1]:
                     confidence = 0.0
                 signal = int(1 if prob_up > threshold else (-1 if prob_up < 1 - threshold else 0))
 
+                # Track row; eligibility will be set after evaluation
                 rows.append(dict(timestamp=ts, prob_up=prob_up, confidence=confidence, signal=signal))
                 df_rows = pd.DataFrame(rows)
                 ph_table.dataframe(df_rows.tail(50), use_container_width=True)
@@ -241,13 +244,39 @@ with tabs[1]:
                     tau = cost.roundtrip_cost_ret
                     if signal == 1:
                         correct = next_ret > tau
+                        pnl = next_ret - tau
                     elif signal == -1:
                         correct = next_ret < -tau
+                        pnl = -next_ret - tau
                     else:
                         correct = abs(next_ret) <= tau
+                        pnl = 0.0
+
+                    # mark eligibility by confidence threshold and non-flat signal
+                    eligible = bool((signal != 0) and (confidence >= min_conf))
                     rows[-1]["next_ret"] = next_ret
                     rows[-1]["correct"] = bool(correct)
+                    rows[-1]["eligible"] = eligible
+                    rows[-1]["pnl"] = float(pnl)
+
+                    # Update metrics on eligible trades
                     df_rows = pd.DataFrame(rows)
+                    df_elig = df_rows[(df_rows.get("eligible", False) == True)]
+                    total = int(len(df_rows))
+                    trades = int((df_rows["signal"] != 0).sum()) if "signal" in df_rows else 0
+                    elig_trades = int(len(df_elig))
+                    wins = int(df_elig["correct"].sum()) if "correct" in df_elig else 0
+                    win_rate = (wins / max(elig_trades, 1)) if elig_trades > 0 else 0.0
+                    cum_pnl = float(df_elig.get("pnl", pd.Series(dtype=float)).sum()) if elig_trades > 0 else 0.0
+
+                    with ph_metrics.container():
+                        mc1, mc2, mc3, mc4 = st.columns(4)
+                        mc1.metric("Eligible trades", f"{elig_trades}")
+                        mc2.metric("Win rate (eligible)", f"{win_rate*100:.1f}%")
+                        mc3.metric("Cum PnL (eligible)", f"{cum_pnl:.3e}")
+                        mc4.metric("All signals", f"{trades}")
+
+                    # Show latest table (tail)
                     ph_table.dataframe(df_rows.tail(50), use_container_width=True)
 
             # Save preview to CSV
