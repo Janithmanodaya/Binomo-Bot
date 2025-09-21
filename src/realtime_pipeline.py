@@ -1,7 +1,7 @@
 import argparse
 import os
 import time
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -9,7 +9,7 @@ import ccxt
 import lightgbm as lgb
 
 from src.run_pipeline import CostModel, tune_threshold_for_pnl, simulate_pnl, sharpe_ratio, max_drawdown, profit_factor
-from src.feature_lib import build_rich_features
+from src.feature_lib import build_rich_features  # thin proxy to features_ta
 
 
 def ensure_dirs():
@@ -39,7 +39,7 @@ def build_labels_for_training(features: pd.DataFrame, cost: CostModel) -> pd.Dat
     return df
 
 
-def feature_target_split(df: pd.DataFrame) -> (pd.DataFrame, pd.Series):
+def feature_target_split(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     exclude = {"open", "high", "low", "close", "volume", "label", "next_ret", "minute", "hour", "dow"}
     feats = [c for c in df.columns if c not in exclude]
     return df[feats], df["label"]
