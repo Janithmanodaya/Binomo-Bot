@@ -148,6 +148,7 @@ def _sample_params(rng: np.random.RandomState, class_weight_list: List[float]) -
         seed=int(rng.randint(1, 10_000)),
         class_weight=class_weight_list,
         subsample=float(rng.uniform(0.6, 0.95)),  # alias for bagging_fraction in some builds
+        feature_pre_filter=False,  # allow dynamic min_data_in_leaf during HPO
     )
 
 
