@@ -78,6 +78,10 @@ class LiveApp(tk.Tk):
         self.live_feat_minutes = tk.IntVar(value=2000)
         self.live_default_thresh = tk.DoubleVar(value=0.55)
 
+        # Advanced training controls
+        self.adv_trials_var = tk.IntVar(value=20)
+        self.adv_backtest_days_var = tk.IntVar(value=7)
+
         self.model_type = tk.StringVar(value="Advanced")  # "Basic" or "Advanced"
 
         def add_row(parent, r, label, widget):
@@ -93,6 +97,8 @@ class LiveApp(tk.Tk):
         add_row(cfg, 5, "Feature minutes (recent):", ttk.Spinbox(cfg, from_=500, to=5000, increment=100, textvariable=self.live_feat_minutes))
         add_row(cfg, 6, "Default decision threshold:", ttk.Spinbox(cfg, from_=0.50, to=0.90, increment=0.01, textvariable=self.live_default_thresh))
         add_row(cfg, 7, "Min confidence (virtual trade):", ttk.Spinbox(cfg, from_=0.00, to=1.00, increment=0.01, textvariable=self._min_conf_var))
+        add_row(cfg, 8, "Advanced trials (HPO):", ttk.Spinbox(cfg, from_=1, to=200, increment=1, textvariable=self.adv_trials_var))
+        add_row(cfg, 9, "Backtest holdout days:", ttk.Spinbox(cfg, from_=0, to=60, increment=1, textvariable=self.adv_backtest_days_var))
 
         # Controls
         btns = ttk.Frame(frm)
@@ -311,15 +317,33 @@ class LiveApp(tk.Tk):
                 self._update_train_progress(stage, p)
                 self.live_status.set(stage)
             self._update_train_progress("Starting training", 0.0)
-            train_multilevel_model(symbol, days, cost, progress=on_prog)
+            train_multilevel_model(
+                symbol,
+                days,
+                cost,
+                progress=on_prog,
+                trials=int(self.adv_trials_var.get()),
+                backtest_days=int(self.adv_backtest_days_var.get()),
+            )
             self._adv_bundle = load_advanced_bundle()
             if self._adv_bundle is None:
                 raise RuntimeError("Advanced model files not found after training.")
-            thr = float(self._adv_bundle["meta"].get("threshold", float(self.live_default_thresh.get())))
+            meta = self._adv_bundle["meta"]
+            thr = float(meta.get("threshold", float(self.live_default_thresh.get())))
             self.train_progress["value"] = 100
             self.train_status.set("Training complete")
             self.live_status.set(f"Model ready (threshold={thr:.2f})")
-            self._append_live_log("Advanced model trained and loaded.\n")
+            # Log backtest metrics if present
+            bt = meta.get("backtest_metrics")
+            if bt:
+                self._append_live_log(
+                    "Advanced model trained and loaded.\n"
+                    f"- Backtest ({bt.get('days', 0)} days): trades={bt.get('trades', 0)}, "
+                    f"win_rate={bt.get('win_rate', 0.0):.3f}, cum_pnl={bt.get('cum_pnl', 0.0):.3e}, "
+                    f"expectancy={bt.get('expectancy', 0.0):.3e}\n"
+                )
+            else:
+                self._append_live_log("Advanced model trained and loaded.\n")
         except Exception as e:
             messagebox.showerror("Advanced Training", str(e))
             self._append_live_log(f"Advanced training error: {e}\n")
@@ -488,7 +512,14 @@ class LiveApp(tk.Tk):
 
                 self._update_train_progress("Starting training", 0.0)
                 try:
-                    train_multilevel_model(symbol, days, cost, progress=on_prog)
+                    train_multilevel_model(
+                        symbol,
+                        days,
+                        cost,
+                        progress=on_prog,
+                        trials=int(self.adv_trials_var.get()),
+                        backtest_days=int(self.adv_backtest_days_var.get()),
+                    )
                 except Exception as e:
                     self._append_live_log(f"Advanced training error: {e}\n")
                     self.live_status.set("Training error")
@@ -505,8 +536,16 @@ class LiveApp(tk.Tk):
                 self._append_live_log("Using loaded advanced model bundle.\n")
 
             bundle = self._adv_bundle
-            thr = float(bundle["meta"].get("threshold", float(self.live_default_thresh.get())))
+            meta = bundle["meta"]
+            thr = float(meta.get("threshold", float(self.live_default_thresh.get())))
             self.live_status.set(f"Model ready (threshold={thr:.2f})")
+            bt = meta.get("backtest_metrics")
+            if bt:
+                self._append_live_log(
+                    f"Backtest ({bt.get('days', 0)} days): trades={bt.get('trades', 0)}, "
+                    f"win_rate={bt.get('win_rate', 0.0):.3f}, cum_pnl={bt.get('cum_pnl', 0.0):.3e}, "
+                    f"expectancy={bt.get('expectancy', 0.0):.3e}\n"
+                )
 
             # Live prediction loop
             while not self._stop_event.is_set():

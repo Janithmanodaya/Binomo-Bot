@@ -182,10 +182,13 @@ def train_multilevel_model(
     days: int,
     cost: CostModel,
     progress: Optional[Callable[[str, float], None]] = None,
+    trials: int = 20,
+    backtest_days: int = 0,
 ) -> Tuple[str, str]:
     """
     Train a multi-level (5-class) LightGBM model and save to data/processed/.
     Includes a small random search over hyperparameters to maximize validation PnL.
+    Optionally keeps the last `backtest_days` out-of-sample for a small backtest.
     Returns (model_path, meta_path).
     """
     def report(stage: str, p: float):
@@ -202,20 +205,37 @@ def train_multilevel_model(
 
     report("Labeling (multi-level)", 0.18)
     labeled = build_multi_level_labels(feats, cost)
-    X, y = feature_target_split(labeled)
+    X_all, y_all = feature_target_split(labeled)
 
     # Remove NaN labels
-    mask = y.notna()
-    X, y = X[mask], y[mask].astype(int)
+    mask_all = y_all.notna()
+    X_all, y_all = X_all[mask_all], y_all[mask_all].astype(int)
+    labeled = labeled.loc[X_all.index]
 
-    if len(X) < 5000:
+    if len(X_all) < 5000:
         raise RuntimeError("Not enough samples for advanced training. Increase days.")
 
-    # Train/validation split: last 15% for threshold tuning
-    split = int(len(X) * 0.85)
-    X_tr, y_tr = X.iloc[:split], y.iloc[:split]
-    X_va, y_va = X.iloc[split:], y.iloc[split:]
-    next_ret_va = labeled.iloc[split:]["next_ret"]
+    # Split out backtest window if requested
+    if backtest_days and backtest_days > 0:
+        bt_cut = labeled.index.max() - pd.Timedelta(days=int(backtest_days))
+        back_mask = labeled.index >= bt_cut
+    else:
+        back_mask = pd.Series(False, index=labeled.index)
+
+    # Train/validation split (on the non-backtest subset): last 15% for threshold tuning
+    idx_train_val = labeled.index[~back_mask]
+    n_tv = len(idx_train_val)
+    if n_tv < 2000:
+        raise RuntimeError("Not enough samples after excluding backtest for training/validation.")
+
+    split = int(n_tv * 0.85)
+    tv_idx_sorted = idx_train_val.sort_values()
+    idx_tr = tv_idx_sorted[:split]
+    idx_va = tv_idx_sorted[split:]
+
+    X_tr, y_tr = X_all.loc[idx_tr], y_all.loc[idx_tr]
+    X_va, y_va = X_all.loc[idx_va], y_all.loc[idx_va]
+    next_ret_va = labeled.loc[idx_va, "next_ret"]
 
     classes = [-2, -1, 0, 1, 2]
     class_to_idx = {c: i for i, c in enumerate(classes)}
@@ -234,11 +254,10 @@ def train_multilevel_model(
     report("Hyperparameter search", 0.22)
     rng = np.random.RandomState(42)
     best_model = None
-    best_params = None
     best_thr = 0.55
     best_mean_pnl = -1e9
 
-    trials = 20  # modest budget; increase if you want more thorough search
+    trials = int(max(1, trials))
     for i in range(trials):
         params = _sample_params(rng, class_weight_list)
         model = lgb.train(
@@ -255,14 +274,12 @@ def train_multilevel_model(
         if mean_pnl > best_mean_pnl:
             best_mean_pnl = mean_pnl
             best_model = model
-            best_params = params
             best_thr = thr
-        # coarse-grained progress update
         if progress:
             progress(f"Hyperparameter search ({i+1}/{trials})", 0.22 + 0.5 * (i + 1) / trials)
 
     if best_model is None:
-        # fallback to a sane default configuration
+        # Fallback default
         params = dict(
             objective="multiclass",
             num_class=5,
@@ -288,6 +305,40 @@ def train_multilevel_model(
         )
         best_thr, best_mean_pnl = _eval_model_pnl(best_model, X_va, next_ret_va, class_to_idx, cost)
 
+    # Optional small backtest on held-out last `backtest_days`
+    backtest_metrics: Dict[str, float] = {}
+    if back_mask.any():
+        report("Backtesting (holdout)", 0.75)
+        idx_bt = labeled.index[back_mask]
+        X_bt = X_all.loc[idx_bt]
+        next_ret_bt = labeled.loc[idx_bt, "next_ret"]
+        proba_bt = best_model.predict(X_bt, num_iteration=getattr(best_model, "best_iteration", None))
+        p_up_bt = proba_bt[:, class_to_idx[1]] + proba_bt[:, class_to_idx[2]]
+        p_up_bt_s = pd.Series(p_up_bt, index=idx_bt)
+        t = float(best_thr)
+        rt_cost = cost.roundtrip_cost_ret
+        signal_bt = np.where(p_up_bt_s > t, 1, np.where(p_up_bt_s < 1 - t, -1, 0))
+        pnl_bt = np.where(signal_bt == 1, next_ret_bt - rt_cost, np.where(signal_bt == -1, -next_ret_bt - rt_cost, 0.0))
+        df_bt = pd.DataFrame(
+            {"prob_up": p_up_bt_s, "signal": signal_bt, "next_ret": next_ret_bt, "pnl": pnl_bt},
+            index=idx_bt,
+        )
+        os.makedirs("data/processed", exist_ok=True)
+        df_bt.to_csv("data/processed/advanced_backtest.csv", index_label="timestamp")
+
+        trades = int((df_bt["signal"] != 0).sum())
+        wins = int(((df_bt["signal"] == 1) & (df_bt["next_ret"] > rt_cost)).sum() + ((df_bt["signal"] == -1) & (df_bt["next_ret"] < -rt_cost)).sum())
+        win_rate = float(wins / trades) if trades > 0 else 0.0
+        cum_pnl = float(df_bt["pnl"].sum())
+        expectancy = float(df_bt["pnl"].mean())
+        backtest_metrics = dict(
+            trades=trades,
+            win_rate=win_rate,
+            cum_pnl=cum_pnl,
+            expectancy=expectancy,
+            days=int(backtest_days),
+        )
+
     report("Finalizing model", 0.80)
 
     # Save model and metadata
@@ -296,13 +347,19 @@ def train_multilevel_model(
     best_model.save_model(model_path)
     meta = AdvancedMeta(
         symbol=symbol,
-        feature_names=list(X.columns),
+        feature_names=list(X_all.columns),
         threshold=float(best_thr),
         taker_fee_bps=float(cost.taker_fee_bps),
         slippage_bps=float(cost.slippage_bps),
         best_iteration=getattr(best_model, "best_iteration", None),
         classes=classes,
     ).__dict__
+    # Add extras
+    meta["trials"] = int(trials)
+    if back_mask.any():
+        meta["backtest_days"] = int(backtest_days)
+        meta["backtest_metrics"] = backtest_metrics
+
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
