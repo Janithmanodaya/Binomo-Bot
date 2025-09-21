@@ -10,14 +10,30 @@ from tkinter import ttk, messagebox, filedialog
 
 # Ensure project root is on sys.path so `from src...` works regardless of CWD
 try:
-    from src.run_pipeline import CostModel, run_pipeline  # type: ignore
-    from src.live_signal import LiveSignalRunner, LiveConfig  # type: ignore
+    from src.run_pipeline import (
+        CostModel,
+        run_pipeline,
+        fetch_recent_ohlcv_ccxt,
+        build_features,
+        build_labels,
+        feature_target_split,
+        final_feature_names,
+        train_final_model_on_all,
+    )  # type: ignore
 except Exception:
     ROOT = Path(__file__).resolve().parents[1]
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
-    from src.run_pipeline import CostModel, run_pipeline  # type: ignore
-    from src.live_signal import LiveSignalRunner, LiveConfig  # type: ignore
+    from src.run_pipeline import (  # type: ignore
+        CostModel,
+        run_pipeline,
+        fetch_recent_ohlcv_ccxt,
+        build_features,
+        build_labels,
+        feature_target_split,
+        final_feature_names,
+        train_final_model_on_all,
+    )
 
 
 class StdoutRedirector:
@@ -36,20 +52,14 @@ class TrainerApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Crypto Baseline Trainer (Tk)")
-        self.geometry("1000x800")
+        self.geometry("980x760")
 
         self._stdout_queue: "queue.Queue[str]" = queue.Queue()
         self._stdout_prev: Optional[object] = None
         self._worker: Optional[threading.Thread] = None
         self._stop_flag = threading.Event()
 
-        # Live members
-        self._live_thread: Optional[threading.Thread] = None
-        self._live_runner: Optional[LiveSignalRunner] = None
-        self._live_stop = threading.Event()
-
-        self._build_ui()
-        self.after(100, self._poll_stdout)
+        # Liveout)
 
     def _build_ui(self):
         frm = ttk.Frame(self, padding=10)
