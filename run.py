@@ -18,8 +18,19 @@ def main():
     else:
         run(f'"{sys.executable}" -m pip install -r "{req_file}"')
 
-    # If user requested the UI, launch Streamlit
-    if "--ui" in sys.argv or "ui" in sys.argv:
+    args = set(sys.argv[1:])
+
+    # Default behavior: if no args, open Tkinter UI (Windows double-click friendly)
+    if not args or "--tk" in args or "tk" in args:
+        tk_script = os.path.join("src", "tk_app.py")
+        if not os.path.exists(tk_script):
+            print(f"{tk_script} not found.")
+            raise SystemExit(1)
+        run(f'"{sys.executable}" "{tk_script}"')
+        return
+
+    # If user requested the Streamlit UI, launch it
+    if "--ui" in args or "ui" in args or "--streamlit" in args:
         ui_script = os.path.join("src", "ui_app.py")
         if not os.path.exists(ui_script):
             print(f"{ui_script} not found.")
@@ -29,8 +40,8 @@ def main():
         run(f'"{sys.executable}" -m streamlit run "{ui_script}" --server.port {port}')
         return
 
-    # 2) Forward all extra args to the pipeline
-    extra_args = [a for a in sys.argv[1:] if a not in {"--ui", "ui"}]
+    # Otherwise forward all args to the pipeline
+    extra_args = [a for a in sys.argv[1:] if a not in {"--ui", "ui", "--streamlit", "--tk", "tk"}]
     extra = " ".join([f'"{a}"' if " " in a else a for a in extra_args])
     script = os.path.join("src", "run_pipeline.py")
     if not os.path.exists(script):

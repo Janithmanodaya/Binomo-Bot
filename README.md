@@ -18,9 +18,14 @@ Quick start
    python src/run_pipeline.py
 
 Or use the UI (recommended for exploration)
-   # Option A (direct)
+   # Tkinter desktop UI (default when double-clicking run.py on Windows)
+   python run.py
+   # Explicitly launch Tkinter UI
+   python run.py --tk
+
+   # Streamlit web UI
    streamlit run src/ui_app.py
-   # Option B (via helper)
+   # Or via helper
    python run.py --ui
    # If the browser doesn't open automatically, go to:
    # http://localhost:8501
