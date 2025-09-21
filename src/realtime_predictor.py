@@ -31,9 +31,19 @@ def wait_until(ts: pd.Timestamp, sleep=0.5):
         time.sleep(sleep)
 
 
-def confidence_from_prob(prob_up: float) -> float:
-    # distance from 0.5 scaled to [0,1]
-    return 2.0 * abs(prob_up - 0.5)
+def confidence_from_prob(prob_up: float, threshold: float) -> float:
+    """
+    Decision-aware confidence in [0,1]:
+      - If long (p >= t): (p - t) / (1 - t)
+      - If short (p <= 1 - t): ((1 - t) - p) / (1 - t)
+      - Else: 0 (flat)
+    """
+    lo = 1.0 - threshold
+    if prob_up >= threshold:
+        return max(0.0, min(1.0, (prob_up - threshold) / (1.0 - threshold)))
+    if prob_up <= lo:
+        return max(0.0, min(1.0, (lo - prob_up) / (1.0 - threshold)))
+    return 0.0
 
 
 def continuous_predict(
@@ -91,7 +101,7 @@ def continuous_predict(
 
         prob_up = float(model.predict(X_last)[0])
         signal = int(1 if prob_up > threshold else (-1 if prob_up < 1 - threshold else 0))
-        conf = confidence_from_prob(prob_up)
+        conf = confidence_from_prob(prob_up, threshold)
 
         if on_tick:
             on_tick({

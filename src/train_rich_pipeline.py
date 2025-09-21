@@ -17,23 +17,18 @@ from src.run_pipeline import (
     sharpe_ratio,
     profit_factor,
     max_drawdown,
+    tune_threshold_for_pnl,
 )
 from src.features_ta import build_rich_features
 
 
 def build_labels(features: pd.DataFrame, cost: CostModel) -> pd.DataFrame:
+    """
+    Cost-aware next-minute label using forward log return of close.
+    """
     df = features.copy()
-    # For labeling we need close prices; use a separate raw fetch-aligned index
-    # Here, assume features index aligns to raw minute index; next_ret based on synthetic 'close' not present here.
-    # We will refetch recent ohlcv to compute next_ret aligned to features.
-    raise_if_missing = False
-    # As a simple approach, keep next_ret as the forward of ret_1 (shift -1)
-    # If ret_1 not present (because we dropped close), add it via proxy:
-    if "ret_1" not in df.columns:
-        # Cannot compute without close; users should pass features that included ret_1
-        # For safety, backfill with 0 and warn via comment in code path.
-        df["ret_1"] = 0.0
-    df["next_ret"] = df["ret_1"].shift(-1)
+    # Robust next return from close to avoid dependency on precomputed ret_1
+    df["next_ret"] = np.log(df["close"]).diff().shift(-1)
     tau = cost.roundtrip_cost_ret
     df["label"] = np.where(df["next_ret"] > tau, 1, np.where(df["next_ret"] < -tau, 0, np.nan))
     df = df.iloc[:-1].copy()
@@ -41,7 +36,13 @@ def build_labels(features: pd.DataFrame, cost: CostModel) -> pd.DataFrame:
 
 
 def feature_target_split(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-    feats = [c for c in df.columns if c not in {"label", "next_ret"}]
+    # Exclude raw OHLCV and explicit target/aux columns and raw time integers
+    exclude = {
+        "open", "high", "low", "close", "volume",
+        "label", "next_ret",
+        "minute", "hour", "dow",
+    }
+    feats = [c for c in df.columns if c not in exclude]
     X = df[feats]
     y = df["label"]
     return X, y
@@ -50,7 +51,13 @@ def feature_target_split(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
 def train_model(X_tr: pd.DataFrame, y_tr: pd.Series, X_va: pd.DataFrame, y_va: pd.Series) -> lgb.Booster:
     tr_mask = y_tr.notna()
     vl_mask = y_va.notna()
-    dtrain = lgb.Dataset(X_tr[tr_mask], label=y_tr[tr_mask])
+    y_trn = y_tr[tr_mask]
+    pos = float((y_trn == 1).sum())
+    neg = float((y_trn == 0).sum())
+    # Handle class imbalance
+    scale_pos_weight = (neg / max(pos, 1.0)) if (pos > 0) else 1.0
+
+    dtrain = lgb.Dataset(X_tr[tr_mask], label=y_trn)
     dval = lgb.Dataset(X_va[vl_mask], label=y_va[vl_mask])
     params = dict(
         objective="binary",
@@ -64,6 +71,8 @@ def train_model(X_tr: pd.DataFrame, y_tr: pd.Series, X_va: pd.DataFrame, y_va: p
         min_data_in_leaf=100,
         verbose=-1,
         seed=42,
+        scale_pos_weight=scale_pos_weight,
+        is_unbalance=False,
     )
     model = lgb.train(
         params,
@@ -108,6 +117,13 @@ def run_train(symbol: str, days: int, cost: CostModel, val_days: int, out_prefix
     auc = roc_auc_score(y_va[va_mask_notna], proba[va_mask_notna]) if va_mask_notna.any() else np.nan
     print(f"Validation AUC: {auc:.4f}")
 
+    # Tune trading threshold on validation by cost-aware PnL
+    if proba.notna().any():
+        tuned_t = tune_threshold_for_pnl(proba.dropna(), next_ret_va.loc[proba.dropna().index], cost)
+    else:
+        tuned_t = 0.55
+    print(f"Tuned decision threshold (val PnL): {tuned_t:.2f}")
+
     # Save model and metadata
     out_dir = "data/processed"
     os.makedirs(out_dir, exist_ok=True)
@@ -119,10 +135,12 @@ def run_train(symbol: str, days: int, cost: CostModel, val_days: int, out_prefix
     meta = dict(
         symbol=symbol,
         feature_names=feature_names,
-        tuned_threshold=0.55,  # let live choose or tune further
+        tuned_threshold=float(tuned_t),
         taker_fee_bps=cost.taker_fee_bps,
         slippage_bps=cost.slippage_bps,
         best_iteration=getattr(model, "best_iteration", None),
+        train_days=days,
+        val_days=val_days,
     )
     with open(meta_file, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -132,10 +150,10 @@ def run_train(symbol: str, days: int, cost: CostModel, val_days: int, out_prefix
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train LightGBM with rich pandas-ta features")
+    p = argparse.ArgumentParser(description="Train LightGBM with rich multi-timeframe features")
     p.add_argument("--symbol", type=str, default="ETH/USDT")
-    p.add_argument("--days", type=int, default=120)
-    p.add_argument("--val-days", type=int, default=14)
+    p.add_argument("--days", type=int, default=180)
+    p.add_argument("--val-days", type=int, default=21)
     p.add_argument("--taker-fee-bps", type=float, default=4.0)
     p.add_argument("--slippage-bps", type=float, default=1.0)
     args = p.parse_args()
