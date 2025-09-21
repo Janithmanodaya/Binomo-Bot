@@ -81,6 +81,8 @@ class LiveApp(tk.Tk):
         # Advanced training controls
         self.adv_trials_var = tk.IntVar(value=20)
         self.adv_backtest_days_var = tk.IntVar(value=7)
+        # Advanced live overrides
+        self.adv_threshold_var = tk.DoubleVar(value=0.00)  # 0 -> use meta threshold
 
         self.model_type = tk.StringVar(value="Advanced")  # "Basic" or "Advanced"
 
@@ -99,6 +101,7 @@ class LiveApp(tk.Tk):
         add_row(cfg, 7, "Min confidence (virtual trade):", ttk.Spinbox(cfg, from_=0.00, to=1.00, increment=0.01, textvariable=self._min_conf_var))
         add_row(cfg, 8, "Advanced trials (HPO):", ttk.Spinbox(cfg, from_=1, to=200, increment=1, textvariable=self.adv_trials_var))
         add_row(cfg, 9, "Backtest holdout days:", ttk.Spinbox(cfg, from_=0, to=60, increment=1, textvariable=self.adv_backtest_days_var))
+        add_row(cfg, 10, "Advanced live threshold (0=auto):", ttk.Spinbox(cfg, from_=0.00, to=0.90, increment=0.01, textvariable=self.adv_threshold_v_codearnew)</)
 
         # Controls
         btns = ttk.Frame(frm)
@@ -609,10 +612,12 @@ class LiveApp(tk.Tk):
 
             # Live prediction loop
             while not self._stop_event.is_set():
+                thr_override = float(self.adv_threshold_var.get())
                 ts, prob_up, strength, conf = adv_predict_latest(
                     symbol=symbol,
                     feature_minutes=int(self.live_feat_minutes.get()),
                     bundle=bundle,
+                    threshold_override=thr_override if thr_override > 0.0 else None,
                 )
                 # Use the advanced model's strength and confidence directly.
                 # strength ∈ {-2,-1,0,1,2} -> directional signal {-1,0,1}
