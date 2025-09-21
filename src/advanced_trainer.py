@@ -95,25 +95,36 @@ def _class_weights(y: pd.Series, classes: List[int]) -> Dict[int, float]:
 def _confidence_from_probs(prob_vec: np.ndarray, threshold: float) -> Tuple[float, int, float]:
     """
     Map class probability vector [p(-2),p(-1),p(0),p(+1),p(+2)] to:
-      - prob_up = p(+1)+p(+2)
-      - signal in {-2,-1,0,1,2} using threshold on prob_up and prob_down
+      - prob_up_cond: conditional P(up | non-flat) = (p(+1)+p(+2)) / (1 - p(0))
+      - signal in {-2,-1,0,1,2} using threshold on conditional up/down
       - confidence in [0,1] proportional to margin beyond threshold
+    This avoids the model defaulting to 'flat' dominating probability by
+    normalizing out the flat mass when making a decision.
     """
     p_down2, p_down1, p_flat, p_up1, p_up2 = prob_vec.tolist()
-    p_up = p_up1 + p_up2
-    p_down = p_down1 + p_down2
-    lo = 1.0 - threshold
+    p_up_raw = p_up1 + p_up2
+    p_down_raw = p_down1 + p_down2
+    p_nonflat = p_up_raw + p_down_raw
+
+    if p_nonflat <= 1e-9:
+        # Degenerate distribution; return neutral
+        return 0.5, 0, 0.0
+
+    # Conditional probabilities given a non-flat move
+    p_up = p_up_raw / p_nonflat
+    p_down = p_down_raw / p_nonflat
 
     if p_up >= threshold and p_up >= p_down:
         # strength by which of (+2 or +1) dominates
         strength = 2 if p_up2 >= p_up1 else 1
         conf = (p_up - threshold) / max(1e-9, 1.0 - threshold)
-        return p_up, strength, max(0.0, min(1.0, float(conf)))
+        return float(p_up), strength, max(0.0, min(1.0, float(conf)))
     if p_down >= threshold and p_down > p_up:
         strength = -2 if p_down2 >= p_down1 else -1
         conf = (p_down - threshold) / max(1e-9, 1.0 - threshold)
-        return p_up, strength, max(0.0, min(1.0, float(conf)))
-    return p_up, 0, 0.0
+        # Return p_up (conditional) for a symmetric display; conf relates to the chosen side
+        return float(p_up), strength, max(0.0, min(1.0, float(conf)))
+    return float(p_up), 0, 0.0
 
 
 def train_multilevel_model(
