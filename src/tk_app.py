@@ -99,7 +99,15 @@ class LiveApp(tk.Tk):
         add_row(cfg, 5, "Feature minutes (recent):", ttk.Spinbox(cfg, from_=500, to=5000, increment=100, textvariable=self.live_feat_minutes))
         add_row(cfg, 6, "Default decision threshold:", ttk.Spinbox(cfg, from_=0.50, to=0.90, increment=0.01, textvariable=self.live_default_thresh))
         add_row(cfg, 7, "Min confidence (virtual trade):", ttk.Spinbox(cfg, from_=0.00, to=1.00, increment=0.01, textvariable=self._min_conf_var))
-        add_row(cfg, 8, "Advanced trials (HPO):", ttk.Spinbox(cfg, from_=1, to=200, increment=1, textvariable=self.adv_trials_var))
+        # Break out widget creation to avoid very long argument lists on one line
+        spin_trials = ttk.Spinbox(cfg, from_=1, to=200, increment=1, textvariable=self.adv_trials_var)
+        add_row(cfg, 8, "Advanced trials (HPO):", spin_trials)
+
+        spin_bt_days = ttk.Spinbox(cfg, from_=0, to=60, increment=1, textvariable=self.adv_backtest_days_var)
+        add_row(cfg, 9, "Backtest holdout days:", spin_bt_days)
+
+        spin_thr = ttk.Spinbox(cfg, from_=0.00, to=0.90, increment=0.01, textvariable=self.adv_threshold_var)
+        add_row(cfg, 10, "Advanced live threshold (0=auto):", spin_thr)
         add_row(cfg, 9, "Backtest holdout days:", ttk.Spinbox(cfg, from_=0, to=60, increment=1, textvariable=self.adv_backtest_days_var))
         add_row(cfg, 10, "Advanced live threshold (0=auto):", ttk.Spinbox(cfg, from_=0.00, to=0.90, increment=0.01, textvariable=self.adv_threshold_v_codearnew)</)
 
