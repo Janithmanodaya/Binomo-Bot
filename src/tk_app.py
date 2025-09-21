@@ -60,8 +60,7 @@ class LiveApp(tk.Tk):
         except Exception as e:
             holder = ttk.Frame(self, padding=12)
             holder.pack(fill=tk.BOTH, expand=True)
-            ttk.Label(holder, text=f"UI error: {e}").pack(anchor=_code"wnew"</)
-="w")
+            ttk.Label(holder, text=f"UI error: {e}").pack(anchor="w")
 
     def _build_ui(self):
         frm = ttk.Frame(self, padding=10)
@@ -113,8 +112,7 @@ class LiveApp(tk.Tk):
         self.load_adv_btn = ttk.Button(adv_btns, text="Load Advanced Model...", command=self.load_advanced_model_dialog)
         self.load_adv_btn.pack(side=tk.LEFT, padx=(8, 0))
         self.dl_hist_btn = ttk.Button(adv_btns, text="Download History", command=self.download_history_now)
-        self.dl_hist_btn.pack(side=tk.LEFT, padx=(8,_code 0new)</)
-)
+        self.dl_hist_btn.pack(side=tk.LEFT, padx=(8, 0))
 
         # Training progress
         progf = ttk.LabelFrame(frm, text="Training progress", padding=10)
@@ -480,8 +478,17 @@ class LiveApp(tk.Tk):
                     feature_minutes=int(self.live_feat_minutes.get()),
                     bundle=bundle,
                 )
-                # Map strength to signal {-1,0,1}
-                sig = int(1 if signal_strength > 0 else (-1 if signal_strength < 0 else 0))
+                # Map probability to signal using decision threshold and derive confidence
+                short_thr = 1.0 - thr
+                if prob_up >= thr:
+                    sig = 1
+                    conf = max(0.0, min(1.0, (prob_up - thr) / (1.0 - thr)))
+                elif prob_up <= short_thr:
+                    sig = -1
+                    conf = max(0.0, min(1.0, (short_thr - prob_up) / (1.0 - thr)))
+                else:
+                    sig = 0
+                    conf = 0.0
 
                 # Emit prediction
                 ts_local_str = str(pd.Timestamp(ts).tz_convert("Asia/Colombo"))
@@ -489,7 +496,7 @@ class LiveApp(tk.Tk):
                     "event": "prediction",
                     "timestamp": ts_local_str,
                     "prob_up": prob_up,
-                    "confidence": confidence,
+                    "confidence": conf,
                     "signal": sig,
                     "threshold": thr,
                 })
