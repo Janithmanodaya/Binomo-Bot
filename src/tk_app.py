@@ -473,22 +473,15 @@ class LiveApp(tk.Tk):
 
             # Live prediction loop
             while not self._stop_event.is_set():
-                ts, prob_up, signal_strength, confidence = adv_predict_latest(
+                ts, prob_up, strength, conf = adv_predict_latest(
                     symbol=symbol,
                     feature_minutes=int(self.live_feat_minutes.get()),
                     bundle=bundle,
                 )
-                # Map probability to signal using decision threshold and derive confidence
-                short_thr = 1.0 - thr
-                if prob_up >= thr:
-                    sig = 1
-                    conf = max(0.0, min(1.0, (prob_up - thr) / (1.0 - thr)))
-                elif prob_up <= short_thr:
-                    sig = -1
-                    conf = max(0.0, min(1.0, (short_thr - prob_up) / (1.0 - thr)))
-                else:
-                    sig = 0
-                    conf = 0.0
+                # Use the advanced model's strength and confidence directly.
+                # strength ∈ {-2,-1,0,1,2} -> directional signal {-1,0,1}
+                sig = 1 if int(strength) > 0 else (-1 if int(strength) < 0 else 0)
+                conf = float(conf)
 
                 # Emit prediction
                 ts_local_str = str(pd.Timestamp(ts).tz_convert("Asia/Colombo"))
