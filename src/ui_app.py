@@ -206,7 +206,14 @@ with tabs[1]:
                 X_row = X_row[feature_names] if feature_names else X_row
 
                 prob_up = float(booster.predict(X_row)[0])
-                confidence = float(2.0 * abs(prob_up - 0.5))  # [0,1]
+                # Decision-aware confidence in [0,1]
+                lo = 1.0 - threshold
+                if prob_up >= threshold:
+                    confidence = float(max(0.0, min(1.0, (prob_up - threshold) / (1.0 - threshold))))
+                elif prob_up <= lo:
+                    confidence = float(max(0.0, min(1.0, (lo - prob_up) / (1.0 - threshold))))
+                else:
+                    confidence = 0.0
                 signal = int(1 if prob_up > threshold else (-1 if prob_up < 1 - threshold else 0))
 
                 rows.append(dict(timestamp=ts, prob_up=prob_up, confidence=confidence, signal=signal))

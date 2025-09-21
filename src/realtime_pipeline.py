@@ -45,6 +45,21 @@ def feature_target_split(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     return df[feats], df["label"]
 
 
+def _confidence_from_prob(prob_up: float, threshold: float) -> float:
+    """
+    Decision-aware confidence in [0,1]:
+      - If long (p >= t): (p - t) / (1 - t)
+      - If short (p <= 1 - t): ((1 - t) - p) / (1 - t)
+      - Else: 0 (flat)
+    """
+    lo = 1.0 - threshold
+    if prob_up >= threshold:
+        return max(0.0, min(1.0, (prob_up - threshold) / (1.0 - threshold)))
+    if prob_up <= lo:
+        return max(0.0, min(1.0, (lo - prob_up) / (1.0 - threshold)))
+    return 0.0
+
+
 def train_model(symbol: str, days: int, cost: CostModel):
     # Fetch lookback via pagination
     print(f"Fetching ~{days} days of 1m OHLCV for {symbol} for training...")
@@ -92,6 +107,13 @@ def train_model(symbol: str, days: int, cost: CostModel):
     tr_mask, va_mask = y_tr.notna(), y_va.notna()
     dtrain = lgb.Dataset(X_tr[tr_mask], label=y_tr[tr_mask])
     dval = lgb.Dataset(X_va[va_mask], label=y_va[va_mask])
+
+    # Handle imbalance with scale_pos_weight
+    y_trn = y_tr[tr_mask]
+    pos = float((y_trn == 1).sum())
+    neg = float((y_trn == 0).sum())
+    scale_pos_weight = (neg / max(pos, 1.0)) if pos > 0 else 1.0
+
     params = dict(
         objective="binary",
         metric=["binary_logloss", "auc"],
@@ -104,6 +126,8 @@ def train_model(symbol: str, days: int, cost: CostModel):
         min_data_in_leaf=100,
         verbose=-1,
         seed=42,
+        scale_pos_weight=scale_pos_weight,
+        is_unbalance=False,
     )
     model = lgb.train(
         params,
@@ -184,7 +208,7 @@ def predict_stream(symbol: str, model_path: str, meta_path: str, minutes_to_run:
         X_last = X_last[feature_names]
 
         prob_up = float(model.predict(X_last)[0])
-        confidence = float(max(prob_up, 1 - prob_up))
+        confidence = float(_confidence_from_prob(prob_up, threshold))
         signal = int(1 if prob_up > threshold else (-1 if prob_up < 1 - threshold else 0))
         next_ts = (current_ts.floor("T") + pd.Timedelta(minutes=1))
 

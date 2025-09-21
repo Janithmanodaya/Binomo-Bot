@@ -27,6 +27,21 @@ class LiveConfig:
     exchange: str = "binance"
 
 
+def _confidence_from_prob(prob_up: float, threshold: float) -> float:
+    """
+    Decision-aware confidence in [0,1]:
+      - If long (p >= t): (p - t) / (1 - t)
+      - If short (p <= 1 - t): ((1 - t) - p) / (1 - t)
+      - Else: 0 (flat)
+    """
+    lo = 1.0 - threshold
+    if prob_up >= threshold:
+        return max(0.0, min(1.0, (prob_up - threshold) / (1.0 - threshold)))
+    if prob_up <= lo:
+        return max(0.0, min(1.0, (lo - prob_up) / (1.0 - threshold)))
+    return 0.0
+
+
 class LiveSignalRunner:
     def __init__(
         self,
@@ -219,7 +234,7 @@ class LiveSignalRunner:
                     self._pending_eval_time = ts
                     self._pending_prob = prob
                     if self.on_update:
-                        confidence = float(2.0 * abs(prob - 0.5))
+                        confidence = float(_confidence_from_prob(prob, self._threshold))
                         ts_loc = self._to_local(ts)
                         self.on_update({
                             "event": "prediction",
