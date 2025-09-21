@@ -56,8 +56,12 @@ class LiveApp(tk.Tk):
 
         # Build UI
         try:
-            self holder.pack(fill=tk.BOTH, expand=True)
-            ttk.Label(holder, text=f"UI error: {e}").pack(anchor="w")
+            self._build_ui()
+        except Exception as e:
+            holder = ttk.Frame(self, padding=12)
+            holder.pack(fill=tk.BOTH, expand=True)
+            ttk.Label(holder, text=f"UI error: {e}").pack(anchor=_code"wnew"</)
+="w")
 
     def _build_ui(self):
         frm = ttk.Frame(self, padding=10)
@@ -105,7 +109,11 @@ class LiveApp(tk.Tk):
         adv_btns = ttk.Frame(frm)
         adv_btns.pack(fill=tk.X, pady=(0, 8))
         self.train_adv_btn = ttk.Button(adv_btns, text="Train Advanced Now", command=self.train_advanced_now)
-        self.train_adv_btn.pack(side=tk)
+        self.train_adv_btn.pack(side=tk.LEFT)
+        self.load_adv_btn = ttk.Button(adv_btns, text="Load Advanced Model...", command=self.load_advanced_model_dialog)
+        self.load_adv_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.dl_hist_btn = ttk.Button(adv_btns, text="Download History", command=self.download_history_now)
+        self.dl_hist_btn.pack(side=tk.LEFT, padx=(8, 0))
 
         # Training progress
         progf = ttk.LabelFrame(frm, text="Training progress", padding=10)
