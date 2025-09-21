@@ -1,3 +1,4 @@
+import os
 import time
 from typing import Callable, Dict, List, Optional
 
@@ -54,6 +55,8 @@ def continuous_predict(
     cost: CostModel,
     on_tick: Optional[Callable[[Dict], None]] = None,
     stop_flag: Optional[Callable[[], bool]] = None,
+    min_confidence: float = 0.0,
+    report_path: Optional[str] = None,
 ):
     """
     Continuously predict every minute:
@@ -62,17 +65,25 @@ def continuous_predict(
       - Predict prob_up using model
       - Emit signal and confidence
       - Wait for next minute close, evaluate correctness, repeat
+
+    Additionally:
+      - If report_path is provided, append/overwrite a CSV with per-minute rows
+      - Use min_confidence to mark which signals are 'eligible' for metrics
+
     stop_flag: callable returning True to terminate loop
     """
     model = lgb.Booster(model_file=model_path)
+
+    # Ensure report directory exists
+    rows: List[Dict] = []
+    if report_path:
+        os.makedirs(os.path.dirname(report_path), exist_ok=True)
 
     # Align to next minute
     nb = next_minute_boundary()
     if on_tick:
         on_tick({"msg": f"Waiting for next minute boundary: {nb} UTC"})
     wait_until(nb)
-
-    last_eval_ts = None
 
     while True:
         if stop_flag and stop_flag():
@@ -103,6 +114,15 @@ def continuous_predict(
         signal = int(1 if prob_up > threshold else (-1 if prob_up < 1 - threshold else 0))
         conf = confidence_from_prob(prob_up, threshold)
 
+        # Pre-store row
+        row: Dict[str, object] = {
+            "timestamp": current_ts,
+            "prob_up": prob_up,
+            "confidence": conf,
+            "signal": signal,
+        }
+        rows.append(row)
+
         if on_tick:
             on_tick({
                 "timestamp": str(current_ts),
@@ -121,22 +141,59 @@ def continuous_predict(
             if on_tick:
                 on_tick({"msg": "Next candle not yet available; skipping evaluation."})
             continue
-        c0 = raw2.loc[current_ts, "close"]
-        c1 = raw2.loc[next_ts, "close"]
+        c0 = float(raw2.loc[current_ts, "close"])
+        c1 = float(raw2.loc[next_ts, "close"])
         next_ret = float(np.log(c1) - np.log(c0))
         tau = cost.roundtrip_cost_ret
 
         if signal == 1:
             correct = next_ret > tau
+            pnl = float(next_ret - tau)
         elif signal == -1:
             correct = next_ret < -tau
+            pnl = float(-next_ret - tau)
         else:
             correct = abs(next_ret) <= tau
+            pnl = 0.0
+
+        # Update last appended row with evaluation
+        rows[-1]["eval_timestamp"] = next_ts
+        rows[-1]["next_ret"] = next_ret
+        rows[-1]["correct"] = bool(correct)
+        eligible = (signal != 0) and (conf >= float(min_confidence))
+        rows[-1]["eligible"] = bool(eligible)
+        rows[-1]["pnl"] = pnl
+
+        # Compute running metrics for eligible signals
+        df = pd.DataFrame(rows)
+        if "eligible" in df.columns and df["eligible"].any():
+            elig = df[df["eligible"] == True]
+            trades = int(len(elig))
+            wins = int(elig["correct"].sum()) if "correct" in elig.columns else 0
+            win_rate = float(wins / trades) if trades > 0 else 0.0
+            cum_pnl = float(elig["pnl"].sum()) if "pnl" in elig.columns else 0.0
+        else:
+            trades = 0
+            win_rate = 0.0
+            cum_pnl = 0.0
+
+        if report_path:
+            # Persist full report on each iteration (small file)
+            out_df = df.copy()
+            out_df.to_csv(report_path, index=False)
 
         if on_tick:
             on_tick({
                 "timestamp_eval": str(next_ts),
                 "next_ret": next_ret,
                 "correct": bool(correct),
-                "msg": f"Evaluation at {next_ts}: next_ret={next_ret:.6e}, correct={correct}",
+                "eligible": bool(eligible),
+                "metrics": {
+                    "eligible_trades": trades,
+                    "win_rate": win_rate,
+                    "cum_pnl": cum_pnl,
+                    "min_confidence": float(min_confidence),
+                },
+                "last_row": rows[-1].copy(),
+                "msg": f"Evaluation at {next_ts}: next_ret={next_ret:.6e}, correct={correct}, eligible={eligible}, trades={trades}, win_rate={win_rate:.3f}, cum_pnl={cum_pnl:.3e}",
             })
