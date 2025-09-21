@@ -127,6 +127,56 @@ def _confidence_from_probs(prob_vec: np.ndarray, threshold: float) -> Tuple[floa
     return float(p_up), 0, 0.0
 
 
+def _sample_params(rng: np.random.RandomState, class_weight_list: List[float]) -> Dict:
+    """Randomly sample a reasonable LightGBM parameter set."""
+    return dict(
+        objective="multiclass",
+        num_class=5,
+        metric=["multi_logloss"],
+        boosting_type="gbdt",
+        num_leaves=int(rng.randint(64, 256)),
+        learning_rate=float(10 ** rng.uniform(-2.0, -1.2)),  # ~[0.01, 0.063]
+        feature_fraction=float(rng.uniform(0.6, 0.95)),
+        bagging_fraction=float(rng.uniform(0.6, 0.95)),
+        bagging_freq=int(rng.randint(1, 6)),
+        min_data_in_leaf=int(rng.randint(50, 400)),
+        max_depth=int(rng.choice([-1, 8, 10, 12])),
+        lambda_l1=float(10 ** rng.uniform(-3.0, 1.0)),  # [0.001, 10]
+        lambda_l2=float(10 ** rng.uniform(-3.0, 1.0)),
+        min_gain_to_split=float(10 ** rng.uniform(-3.0, 0.7)),  # [0.001, 5]
+        verbose=-1,
+        seed=int(rng.randint(1, 10_000)),
+        class_weight=class_weight_list,
+        subsample=float(rng.uniform(0.6, 0.95)),  # alias for bagging_fraction in some builds
+    )
+
+
+def _eval_model_pnl(
+    model: "lgb.Booster",
+    X_va: pd.DataFrame,
+    next_ret_va: pd.Series,
+    class_to_idx: Dict[int, int],
+    cost: CostModel,
+) -> Tuple[float, float]:
+    """
+    Return (best_threshold, mean_pnl) on validation using cost-aware pnl.
+    """
+    import lightgbm as lgb  # type: ignore
+    proba_va = model.predict(X_va, num_iteration=getattr(model, "best_iteration", None))
+    if proba_va is None or len(proba_va) == 0:
+        return 0.55, -1e9
+    proba_up = proba_va[:, class_to_idx[1]] + proba_va[:, class_to_idx[2]]
+    proba_up_s = pd.Series(proba_up, index=X_va.index)
+    threshold = tune_threshold_for_pnl(proba_up_s, next_ret_va.loc[proba_up_s.index], cost)
+    # Compute mean pnl at this threshold
+    t = float(threshold)
+    rt_cost = cost.roundtrip_cost_ret
+    signal = np.where(proba_up_s > t, 1, np.where(proba_up_s < 1 - t, -1, 0))
+    pnl = np.where(signal == 1, next_ret_va - rt_cost, np.where(signal == -1, -next_ret_va - rt_cost, 0.0))
+    mean_pnl = float(np.mean(pnl))
+    return float(threshold), mean_pnl
+
+
 def train_multilevel_model(
     symbol: str,
     days: int,
@@ -135,6 +185,7 @@ def train_multilevel_model(
 ) -> Tuple[str, str]:
     """
     Train a multi-level (5-class) LightGBM model and save to data/processed/.
+    Includes a small random search over hyperparameters to maximize validation PnL.
     Returns (model_path, meta_path).
     """
     def report(stage: str, p: float):
@@ -173,59 +224,83 @@ def train_multilevel_model(
 
     # Class weights to handle imbalance
     cw = _class_weights(y_tr, classes)
-    # Convert to LightGBM format: list weights by class index order
     class_weight_list = [cw[c] for c in classes]
 
     import lightgbm as lgb
     dtrain = lgb.Dataset(X_tr, label=y_tr_idx)
     dval = lgb.Dataset(X_va, label=y_va_idx)
 
-    params = dict(
-        objective="multiclass",
-        num_class=5,
-        metric=["multi_logloss"],
-        boosting_type="gbdt",
-        num_leaves=128,
-        learning_rate=0.03,
-        feature_fraction=0.85,
-        bagging_fraction=0.8,
-        bagging_freq=1,
-        min_data_in_leaf=200,
-        verbose=-1,
-        seed=42,
-        class_weight=class_weight_list,
-    )
-    report("Training model", 0.22)
-    model = lgb.train(
-        params,
-        dtrain,
-        num_boost_round=5000,
-        valid_sets=[dtrain, dval],
-        valid_names=["train", "valid"],
-        callbacks=[
-            lgb.early_stopping(stopping_rounds=250, verbose=False),
-            lgb.log_evaluation(period=200),
-        ],
-    )
-    report("Tuning threshold", 0.80)
+    # Random search over params to maximize validation mean PnL
+    report("Hyperparameter search", 0.22)
+    rng = np.random.RandomState(42)
+    best_model = None
+    best_params = None
+    best_thr = 0.55
+    best_mean_pnl = -1e9
 
-    # Build p_up series for validation to tune threshold
-    proba_va = model.predict(X_va, num_iteration=model.best_iteration)  # shape [N,5]
-    proba_up = proba_va[:, class_to_idx[1]] + proba_va[:, class_to_idx[2]]
-    proba_up_s = pd.Series(proba_up, index=X_va.index)
-    threshold = tune_threshold_for_pnl(proba_up_s, next_ret_va.loc[proba_up_s.index], cost)
+    trials = 20  # modest budget; increase if you want more thorough search
+    for i in range(trials):
+        params = _sample_params(rng, class_weight_list)
+        model = lgb.train(
+            params,
+            dtrain,
+            num_boost_round=4000,
+            valid_sets=[dtrain, dval],
+            valid_names=["train", "valid"],
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=200, verbose=False),
+            ],
+        )
+        thr, mean_pnl = _eval_model_pnl(model, X_va, next_ret_va, class_to_idx, cost)
+        if mean_pnl > best_mean_pnl:
+            best_mean_pnl = mean_pnl
+            best_model = model
+            best_params = params
+            best_thr = thr
+        # coarse-grained progress update
+        if progress:
+            progress(f"Hyperparameter search ({i+1}/{trials})", 0.22 + 0.5 * (i + 1) / trials)
 
-    report("Saving model", 0.92)
+    if best_model is None:
+        # fallback to a sane default configuration
+        params = dict(
+            objective="multiclass",
+            num_class=5,
+            metric=["multi_logloss"],
+            boosting_type="gbdt",
+            num_leaves=128,
+            learning_rate=0.03,
+            feature_fraction=0.85,
+            bagging_fraction=0.8,
+            bagging_freq=1,
+            min_data_in_leaf=200,
+            verbose=-1,
+            seed=42,
+            class_weight=class_weight_list,
+        )
+        best_model = lgb.train(
+            params,
+            dtrain,
+            num_boost_round=3000,
+            valid_sets=[dtrain, dval],
+            valid_names=["train", "valid"],
+            callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)],
+        )
+        best_thr, best_mean_pnl = _eval_model_pnl(best_model, X_va, next_ret_va, class_to_idx, cost)
+
+    report("Finalizing model", 0.80)
+
+    # Save model and metadata
     model_path = "data/processed/advanced_model.txt"
     meta_path = "data/processed/advanced_meta.json"
-    model.save_model(model_path)
+    best_model.save_model(model_path)
     meta = AdvancedMeta(
         symbol=symbol,
         feature_names=list(X.columns),
-        threshold=float(threshold),
+        threshold=float(best_thr),
         taker_fee_bps=float(cost.taker_fee_bps),
         slippage_bps=float(cost.slippage_bps),
-        best_iteration=getattr(model, "best_iteration", None),
+        best_iteration=getattr(best_model, "best_iteration", None),
         classes=classes,
     ).__dict__
     with open(meta_path, "w", encoding="utf-8") as f:
