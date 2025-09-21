@@ -13,7 +13,6 @@ from src.run_pipeline import (
     feature_target_split,
     train_lightgbm,
     tune_threshold_for_pnl,
-    final_feature_names,
 )
 # Use rich multi-timeframe features for live logic
 from src.feature_lib import build_rich_features
@@ -62,6 +61,10 @@ class LiveSignalRunner:
 
     def _utc_now_ms(self) -> int:
         return int(pd.Timestamp.now(tz="UTC").value // 1_000_000)
+
+    def _to_local(self, ts: pd.Timestamp) -> pd.Timestamp:
+        # Convert a UTC timestamp to Sri Lanka time (Asia/Colombo, UTC+5:30)
+        return pd.Timestamp(ts).tz_convert("Asia/Colombo")
 
     def fetch_recent_minutes(self, minutes: int) -> pd.DataFrame:
         """
@@ -204,7 +207,8 @@ class LiveSignalRunner:
                     res = self._evaluate_previous(self._pending_eval_time)
                     if res is not None:
                         if self.on_update:
-                            self.on_update({"event": "evaluation", "timestamp": str(self._to_local(self._pending_eval_time)), "correct": res})
+                            ts_loc_eval = self._to_local(self._pending_eval_time)
+                            self.on_update({"event": "evaluation", "timestamp": str(ts_loc_eval), "correct": res})
                         self._pending_eval_time = None
                         self._pending_prob = None
 
@@ -215,16 +219,16 @@ class LiveSignalRunner:
                     self._pending_eval_time = ts
                     self._pending_prob = prob
                     if self.on_update:
-                        confidence = 2.0 * abs(prob - 0.5)
-                        ts_loc = ts.tz_convert("Asia/Colombo")
+                        confidence = float(2.0 * abs(prob - 0.5))
+                        ts_loc = self._to_local(ts)
                         self.on_update({
                             "event": "prediction",
-                            "timestamp": ts,
-                            "timestamp_local": ts_loc,
+                            "timestamp": str(ts_loc),
                             "prob_up": prob,
                             "confidence": confidence,
                             "signal": int(signal),
-                            "threshold })
+                            "threshold": float(self._threshold),
+                        })
 
                 # Sleep until next minute boundary
                 now = pd.Timestamp.now(tz="UTC")
