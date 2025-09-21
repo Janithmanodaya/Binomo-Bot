@@ -165,8 +165,18 @@ class LiveApp(tk.Tk):
             self.trades_view.column(c, width=110, anchor="center")
         self.trades_view.pack(fill=tk.BOTH, expand=True)
 
+        # Backtest summary table
+        backtestf = ttk.LabelFrame(lower, text="Backtest summary", padding=6)
+        bt_cols = ("days", "trades", "win_rate", "cum_pnl", "expectancy")
+        self.backtest_view = ttk.Treeview(backtestf, columns=bt_cols, show="headings", height=6)
+        for c in bt_cols:
+            self.backtest_view.heading(c, text=c)
+            self.backtest_view.column(c, width=110, anchor="center")
+        self.backtest_view.pack(fill=tk.BOTH, expand=True)
+
         lower.add(live_logf, weight=1)
         lower.add(tradesf, weight=1)
+        lower.add(backtestf, weight=0)
 
     # ---------------- Helpers ----------------
     def _append_live_log(self, text: str):
@@ -333,8 +343,14 @@ class LiveApp(tk.Tk):
             self.train_progress["value"] = 100
             self.train_status.set("Training complete")
             self.live_status.set(f"Model ready (threshold={thr:.2f})")
-            # Log backtest metrics if present
+            # Log backtest metrics if present and update table
             bt = meta.get("backtest_metrics")
+            # Clear backtest table
+            try:
+                for item in self.backtest_view.get_children():
+                    self.backtest_view.delete(item)
+            except Exception:
+                pass
             if bt:
                 self._append_live_log(
                     "Advanced model trained and loaded.\n"
@@ -342,6 +358,16 @@ class LiveApp(tk.Tk):
                     f"win_rate={bt.get('win_rate', 0.0):.3f}, cum_pnl={bt.get('cum_pnl', 0.0):.3e}, "
                     f"expectancy={bt.get('expectancy', 0.0):.3e}\n"
                 )
+                try:
+                    self.backtest_view.insert("", tk.END, values=(
+                        bt.get("days", 0),
+                        bt.get("trades", 0),
+                        f"{bt.get('win_rate', 0.0):.3f}",
+                        f"{bt.get('cum_pnl', 0.0):.3e}",
+                        f"{bt.get('expectancy', 0.0):.3e}",
+                    ))
+                except Exception:
+                    pass
             else:
                 self._append_live_log("Advanced model trained and loaded.\n")
         except Exception as e:
@@ -374,6 +400,24 @@ class LiveApp(tk.Tk):
             thr = float(meta.get("threshold", float(self.live_default_thresh.get())))
             self.live_status.set(f"Loaded model (threshold={thr:.2f})")
             self._append_live_log(f"Loaded model:\n- model: {model_path}\n- meta: {meta_path}\n")
+            # Populate backtest summary table if available
+            bt = meta.get("backtest_metrics")
+            try:
+                for item in self.backtest_view.get_children():
+                    self.backtest_view.delete(item)
+            except Exception:
+                pass
+            if bt:
+                try:
+                    self.backtest_view.insert("", tk.END, values=(
+                        bt.get("days", 0),
+                        bt.get("trades", 0),
+                        f"{bt.get('win_rate', 0.0):.3f}",
+                        f"{bt.get('cum_pnl', 0.0):.3e}",
+                        f"{bt.get('expectancy', 0.0):.3e}",
+                    ))
+                except Exception:
+                    pass
         except Exception as e:
             messagebox.showerror("Load Model", str(e))
 
@@ -540,12 +584,28 @@ class LiveApp(tk.Tk):
             thr = float(meta.get("threshold", float(self.live_default_thresh.get())))
             self.live_status.set(f"Model ready (threshold={thr:.2f})")
             bt = meta.get("backtest_metrics")
+            # Clear and update backtest table
+            try:
+                for item in self.backtest_view.get_children():
+                    self.backtest_view.delete(item)
+            except Exception:
+                pass
             if bt:
                 self._append_live_log(
                     f"Backtest ({bt.get('days', 0)} days): trades={bt.get('trades', 0)}, "
                     f"win_rate={bt.get('win_rate', 0.0):.3f}, cum_pnl={bt.get('cum_pnl', 0.0):.3e}, "
                     f"expectancy={bt.get('expectancy', 0.0):.3e}\n"
                 )
+                try:
+                    self.backtest_view.insert("", tk.END, values=(
+                        bt.get("days", 0),
+                        bt.get("trades", 0),
+                        f"{bt.get('win_rate', 0.0):.3f}",
+                        f"{bt.get('cum_pnl', 0.0):.3e}",
+                        f"{bt.get('expectancy', 0.0):.3e}",
+                    ))
+                except Exception:
+                    pass
 
             # Live prediction loop
             while not self._stop_event.is_set():
