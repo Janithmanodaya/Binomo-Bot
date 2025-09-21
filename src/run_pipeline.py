@@ -261,27 +261,48 @@ def rolling_windows(df: pd.DataFrame, folds: int, val_days: int) -> List[Tuple[p
     return windows
 
 
-def tune_threshold_for_pnl(probs: pd.Series, next_ret: pd.Series, cost: CostModel) -> float:
+def tune_threshold_for_pnl(probs: pd.Series, next_ret: pd.Series, cost: CostModel, min_trade_rate: float = 0.002) -> float:
     """
     Sweep decision thresholds and pick the one that maximizes average PnL after costs.
     Strategy:
       - Long if p > t
       - Short if p < 1 - t
       - Else flat
-    """
-    thresholds = np.linspace(0.5, 0.7, 21)  # focus on confident trades
-    best_t = 0.55
-    best_pnl = -1e9
-    rt_cost = cost.roundtrip_cost_ret
 
-    for t in thresholds:
-        long_mask = probs > t
-        short_mask = probs < (1 - t)
-        pnl = np.where(long_mask, next_ret - rt_cost, 0.0) + np.where(short_mask, -next_ret - rt_cost, 0.0)
-        avg = pnl.mean()
-        if avg > best_pnl:
-            best_pnl = avg
-            best_t = t
+    min_trade_rate: minimum fraction of samples that should result in a trade.
+                    If the optimal threshold yields fewer trades than this rate,
+                    fallback to a lighter threshold grid to avoid degenerate 'no-trade' solutions.
+    """
+    # Start with a tighter band around 0.5 to encourage some trading, then expand
+    grids = [
+        np.linspace(0.51, 0.60, 19),
+        np.linspace(0.50, 0.65, 31),
+        np.linspace(0.50, 0.70, 41),
+    ]
+
+    rt_cost = cost.roundtrip_cost_ret
+    best_t = 0.55
+    best_pnl = -1e12
+    best_trade_rate = 0.0
+
+    for thresholds in grids:
+        for t in thresholds:
+            long_mask = probs > t
+            short_mask = probs < (1 - t)
+            trades = (long_mask | short_mask)
+            trade_rate = trades.mean() if len(trades) > 0 else 0.0
+            pnl = np.where(long_mask, next_ret - rt_cost, 0.0) + np.where(short_mask, -next_ret - rt_cost, 0.0)
+            avg = pnl.mean()
+            # Prefer higher pnl; in tie, prefer more trades
+            if (avg > best_pnl) or (np.isclose(avg, best_pnl) and trade_rate > best_trade_rate):
+                best_pnl = avg
+                best_t = float(t)
+                best_trade_rate = float(trade_rate)
+
+        # If we already meet the min trade rate, stop searching wider grids
+        if best_trade_rate >= min_trade_rate:
+            break
+
     return float(best_t)
 
 
@@ -335,24 +356,24 @@ def train_lightgbm(X_train: pd.DataFrame, y_train: pd.Series, X_val: pd.DataFram
         objective="binary",
         metric=["binary_logloss", "auc"],
         boosting_type="gbdt",
-        num_leaves=64,
-        learning_rate=0.05,
+        num_leaves=96,
+        learning_rate=0.03,
         feature_fraction=0.8,
         bagging_fraction=0.8,
         bagging_freq=1,
-        min_data_in_leaf=50,
+        min_data_in_leaf=100,
         verbose=-1,
         seed=42,
     )
     model = lgb.train(
         params,
         dtrain,
-        num_boost_round=2000,
+        num_boost_round=4000,
         valid_sets=[dtrain, dval],
         valid_names=["train", "valid"],
         callbacks=[
-            lgb.early_stopping(stopping_rounds=100, verbose=False),
-            lgb.log_evaluation(period=100),
+            lgb.early_stopping(stopping_rounds=200, verbose=False),
+            lgb.log_evaluation(period=50),
         ],
     )
     return model
@@ -449,7 +470,8 @@ def run_pipeline(
 
         # Threshold tuning by validation PnL
         if proba.notna().any():
-            t_opt = tune_threshold_for_pnl(proba.dropna(), next_ret_va.loc[proba.dropna().index], cost)
+            idx = proba.dropna().index
+            t_opt = tune_threshold_for_pnl(proba.loc[idx], next_ret_va.loc[idx], cost, min_trade_rate=0.002)
         else:
             t_opt = default_prob_threshold
 

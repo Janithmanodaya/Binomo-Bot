@@ -62,7 +62,8 @@ class StdoutRedirector:
             self.q.put(s)
 
     def flush(self):
-        pass
+        # Some libraries call flush; keep compatible
+        return
 
 
 class TrainerApp(tk.Tk):
@@ -231,7 +232,9 @@ class TrainerApp(tk.Tk):
         self.footer.configure(text="Predictions: (running)")
 
         self._stdout_prev = sys.stdout
+        self._stderr_prev: Optional[object] = sys.stderr  # type: ignore
         sys.stdout = StdoutRedirector(self._stdout_queue)  # type: ignore
+        sys.stderr = StdoutRedirector(self._stdout_queue)  # type: ignore
 
         self._worker = threading.Thread(target=self._run_training_thread, daemon=True)
         self._worker.start()
@@ -285,8 +288,12 @@ class TrainerApp(tk.Tk):
             if self._stdout_prev is not None:
                 sys.stdout = self._stdout_prev  # type: ignore
                 self._stdout_prev = None
+            if hasattr(self, "_stderr_prev") and self._stderr_prev is not None:  # type: ignore
+                sys.stderr = self._stderr_prev  # type: ignore
+                self._stderr_prev = None  # type: ignore
             self.start_btn.configure(state=tk.NORMAL)
-            self.stop_btn.configure(state=tk.DISABLED)
+            self.stop_btn.configure(state=tk.DISAB_codeLEnewD</)
+tk.DISABLED)
 
     def open_output(self):
         text = self.footer.cget("text")
