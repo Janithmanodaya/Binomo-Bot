@@ -8,10 +8,14 @@ from typing import Dict, Optional, Callable
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
+# Ensure project root is on sys.path so `from src...` works regardless of CWD
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 # Live components
 from src.live_signal import LiveConfig, LiveSignalRunner  # type: ignore
 
-# Ensure project root is on sys.path so `from src...` works regardless of CWD
 try:
     from src.run_pipeline import (
         CostModel,
@@ -24,9 +28,19 @@ try:
         train_final_model_on_all,
     )  # type: ignore
 except Exception:
-    ROOT = Path(__file__).resolve().parents[1]
+    # As a fallback, ensure ROOT is present (should already be)
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
+    from src.run_pipeline import (  # type: ignore
+        CostModel,
+        run_pipeline,
+        fetch_recent_ohlcv_ccxt,
+        build_features,
+        build_labels,
+        feature_target_split,
+        final_feature_names,
+        train_final_model_on_all,
+    )
     from src.run_pipeline import (  # type: ignore
         CostModel,
         run_pipeline,
