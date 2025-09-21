@@ -13,6 +13,7 @@ from src.run_pipeline import (
     feature_target_split,
     train_lightgbm,
     tune_threshold_for_pnl,
+    final_feature_names,
 )
 # Use rich multi-timeframe features for live logic
 from src.feature_lib import build_rich_features
@@ -41,6 +42,7 @@ class LiveSignalRunner:
         self._stop = False
         self._ex = None
         self._model = None
+        self._feature_names: Optional[List[str]] = None
         self._threshold = cfg.default_threshold
         self._last_pred_time: Optional[pd.Timestamp] = None
         self._pending_eval_time: Optional[pd.Timestamp] = None
@@ -118,6 +120,7 @@ class LiveSignalRunner:
         else:
             t_opt = self.cfg.default_threshold
         self._model = model
+        self._feature_names = list(X.columns)
         self._threshold = float(t_opt)
         if self.on_update:
             self.on_update({"event": "model_ready", "threshold": self._threshold})
@@ -135,12 +138,14 @@ class LiveSignalRunner:
         # Use latest completed index
         ts = feats.index[-1]
         X_row = feats.iloc[[-1]].copy()
-        # Build feature set like in training
-        X_all, _ = feature_target_split(feats)
-        feats_cols = X_all.columns
-        X_row = X_row[feats_cols]
-        prob = float(self._model.predict(X_row, num_iteration=self._model.best_iteration)[0])
-        signal = 1 if prob > self._threshold else (-1 if prob < 1 - self._threshold else 0)
+        # Align feature columns to the trained model
+        if not self._feature_names:
+            raise RuntimeError("Model feature names are not set.")
+        for col in self._feature_names:
+            if col not in X_row.columns:
+                X_row[col] = 0.0
+        X_row = X_row[self._feature_names]
+        problf._threshold else 0)
         return ts, prob, signal
 
     def _evaluate_previous(self, prev_ts: pd.Timestamp) -> Optional[bool]:
