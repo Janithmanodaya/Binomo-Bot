@@ -9,12 +9,13 @@ import ccxt
 
 from src.run_pipeline import (
     CostModel,
-    build_features,
     build_labels,
     feature_target_split,
     train_lightgbm,
     tune_threshold_for_pnl,
 )
+# Use rich multi-timeframe features for live logic
+from src.feature_lib import build_rich_features
 
 
 @dataclass
@@ -96,7 +97,8 @@ class LiveSignalRunner:
         if self.on_update:
             self.on_update({"event": "status", "message": f"Training live model on last {self.cfg.train_days} days..."})
         ohlcv = self.fetch_train_days(self.cfg.train_days)
-        feats = build_features(ohlcv)
+        # Use multi-timeframe rich features
+        feats = build_rich_features(ohlcv)
         labeled = build_labels(feats, self.cost)
         X, y = feature_target_split(labeled)
         # Simple split: last 10% for validation threshold tuning
@@ -151,7 +153,7 @@ class LiveSignalRunner:
         if now <= prev_ts + pd.Timedelta(minutes=1, seconds=5):
             return None  # too soon
         recent = self.fetch_recent_minutes(self.cfg.feature_minutes)
-        feats = build_features(recent)
+        feats = build_rich_features(recent)
         lbl = build_labels(feats, self.cost)
         if prev_ts not in lbl.index:
             return None
