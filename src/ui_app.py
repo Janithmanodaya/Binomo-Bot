@@ -185,7 +185,7 @@ with tabs[1]:
             booster: lgb.Booster = bundle["booster"]
             meta = bundle["meta"]
             feature_names: List[str] = list(meta.get("feature_names", []))
-            threshold: float = float(meta.get("threshold", 0.55"))
+            threshold: float = float(meta.get("threshold", 0.55))
 
             st.info(f"Using threshold={threshold:.2f}")
             ph_status = st.empty()
@@ -368,7 +368,7 @@ with tabs[2]:
 
                 # Wait for next bar and evaluate correctness vs cost-aware threshold
                 next_ts = (pd.Timestamp(ts).floor("T") + pd.Timedelta(minutes=1)).tz_convert("UTC")
-                sleep_s = max(2.0, (next_ts - pd.Timestamp.now(tz=\"UTC\")).total_seconds() + 2.0)
+                sleep_s = max(2.0, (next_ts - pd.Timestamp.now(tz=""UTC\")).total_seconds() + 2.0)
                 time.sleep(sleep_s)
 
                 # Evaluate
