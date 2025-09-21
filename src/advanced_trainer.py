@@ -158,15 +158,15 @@ def _eval_model_pnl(
     next_ret_va: pd.Series,
     class_to_idx: Dict[int, int],
     cost: CostModel,
+    min_confidence: float = 0.20,
 ) -> Tuple[float, float]:
     """
     Return (best_threshold, mean_pnl) on validation using cost-aware pnl.
 
-    IMPORTANT: Uses CONDITIONAL p_up = P(up | non-flat) for both tuning and signal generation
-    to match the live advanced decision logic.
+    Uses CONDITIONAL p_up = P(up | non-flat) to match live logic and applies a
+    minimum confidence filter when generating trades during threshold search.
     """
-    import lightgbm as lgb  # type: ignore
-    proba_va = model.predict(X_va, num_iteration=getattr(model, "best_iteration", None))
+    import lightgbm as lgb  #um_iteration=getattr(model, "best_iteration", None))
     if proba_va is None or len(proba_va) == 0:
         return 0.55, -1e9
 
@@ -293,7 +293,7 @@ def train_multilevel_model(
                 lgb.early_stopping(stopping_rounds=200, verbose=False),
             ],
         )
-        thr, mean_pnl = _eval_model_pnl(model, X_va, next_ret_va, class_to_idx, cost)
+        thr, mean_pnl = _eval_model_pnl(model, X_va, next_ret_va, class_to_idx, cost, min_confidence=0.20)
         if mean_pnl > best_mean_pnl:
             best_mean_pnl = mean_pnl
             best_model = model
@@ -326,7 +326,8 @@ def train_multilevel_model(
             valid_names=["train", "valid"],
             callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)],
         )
-        best_thr, best_mean_pnl = _eval_model_pnl(best_model, X_va, next_ret_va, class_to_idx, cost)
+        best_thr, best_mean_pnl = _eval_model_pnl(best_model, X_va, next_ret_va, class_to_idx, cost, min_confidence=0_code.2new0</)
+
 
     # Optional small backtest on held-out last `backtest_days`
     backtest_metrics: Dict[str, float] = {}
