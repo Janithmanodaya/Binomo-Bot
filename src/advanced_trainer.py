@@ -166,32 +166,57 @@ def _eval_model_pnl(
     Uses CONDITIONAL p_up = P(up | non-flat) to match live logic and applies a
     minimum confidence filter when generating trades during threshold search.
     """
-    import lightgbm as lgb  #um_iteration=getattr(model, "best_iteration", None))
+    import lightgbm as lgb  # type: ignore
+
+    proba_va = model.predict(X_va, num_iteration=getattr(model, "best_iteration", None))
     if proba_va is None or len(proba_va) == 0:
         return 0.55, -1e9
 
+    # Extract class probabilities
     p_down2 = proba_va[:, class_to_idx[-2]]
     p_down1 = proba_va[:, class_to_idx[-1]]
-    p_flat  = proba_va[:, class_to_idx[0]]
-    p_up1   = proba_va[:, class_to_idx[1]]
-    p_up2   = proba_va[:, class_to_idx[2]]
+    p_up1 = proba_va[:, class_to_idx[1]]
+    p_up2 = proba_va[:, class_to_idx[2]]
 
     p_up_raw = p_up1 + p_up2
     p_down_raw = p_down1 + p_down2
     p_nonflat = p_up_raw + p_down_raw
+
     with np.errstate(divide="ignore", invalid="ignore"):
         p_up_cond = np.where(p_nonflat > 1e-12, p_up_raw / p_nonflat, 0.5)
+        p_down_cond = np.where(p_nonflat > 1e-12, p_down_raw / p_nonflat, 0.5)
 
     p_up_cond_s = pd.Series(p_up_cond, index=X_va.index)
+    p_down_cond_s = pd.Series(p_down_cond, index=X_va.index)
     rt_cost = cost.roundtrip_cost_ret
 
-    # Sweep thresholds on conditional p_up in a wider band to reduce overtrading
-    thresholds = np.linspace(0.55, 0.85, 31)
+    thresholds = np.linspace(0.58, 0.82, 25)
     best_t = 0.65
-    best_mean = -1e9
+    best_mean = -1e-9  # avoid selecting empty/flat by mistake
+
     for t in thresholds:
-        signal = np.where(p_up_cond_s > t, 1, np.where(p_up_cond_s < 1 - t, -1, 0))
-        pnl = np.where(signal == 1, next_ret_va - rt_cost, np.where(signal == -1, -next_ret_va - rt_cost, 0.0))
+        # Decision masks
+        up_mask = p_up_cond_s >= t
+        down_mask = p_down_cond_s >= t
+
+        # Direction decision
+        signal = np.where(up_mask & (p_up_cond_s >= p_down_cond_s), 1, 0)
+        signal = np.where(down_mask & (p_down_cond_s > p_up_cond_s), -1, signal)
+
+        # Confidence
+        denom = max(1e-9, 1.0 - float(t))
+        conf_up = (p_up_cond_s.values - float(t)) / denom
+        conf_down = (p_down_cond_s.values - float(t)) / denom
+        conf = np.zeros_like(conf_up)
+        conf = np.where(signal == 1, conf_up, conf)
+        conf = np.where(signal == -1, conf_down, conf)
+
+        # Eligibility by confidence
+        eligible = conf >= float(min_confidence)
+        signal = np.where(eligible, signal, 0)
+
+        pnl = np.where(signal == 1, next_ret_va.values - rt_cost,
+                       np.where(signal == -1, -next_ret_va.values - rt_cost, 0.0))
         mean_pnl = float(np.mean(pnl))
         if mean_pnl > best_mean:
             best_mean = mean_pnl
@@ -326,7 +351,7 @@ def train_multilevel_model(
             valid_names=["train", "valid"],
             callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)],
         )
-        best_thr, best_mean_pnl = _eval_model_pnl(best_model, X_va, next_ret_va, class_to_idx, cost, min_confidence=0_code.2new0</)
+        best_thr, best_mean_pnl = _eval_model_pnl(best_model, X_va, next_ret_va, class_to_idx, cost, min_confidence=0.20)
 
 
     # Optional small backtest on held-out last `backtest_days`
