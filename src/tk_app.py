@@ -292,8 +292,7 @@ class TrainerApp(tk.Tk):
                 sys.stderr = self._stderr_prev  # type: ignore
                 self._stderr_prev = None  # type: ignore
             self.start_btn.configure(state=tk.NORMAL)
-            self.stop_btn.configure(state=tk.DISAB_codeLEnewD</)
-tk.DISABLED)
+            self.stop_btn.configure(state=tk.DISABLED)
 
     def open_output(self):
         text = self.footer.cget("text")
