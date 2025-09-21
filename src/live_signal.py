@@ -129,7 +129,7 @@ class LiveSignalRunner:
         Returns (timestamp, prob_up, signal)
         """
         recent = self.fetch_recent_minutes(self.cfg.feature_minutes)
-        feats = build_features(recent)
+        feats = build_rich_features(recent)
         if feats.empty:
             raise RuntimeError("No features computed in live prediction.")
         # Use latest completed index
