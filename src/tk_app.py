@@ -444,11 +444,12 @@ class TrainerApp(tk.Tk):
         elif evt == "prediction":
             ts = msg.get("timestamp")
             prob = float(msg.get("prob_up")) if msg.get("prob_up") is not None else float("nan")
+            conf = float(msg.get("confidence")) if msg.get("confidence") is not None else float("nan")
             sig = int(msg.get("signal")) if msg.get("signal") is not None else 0
-            self.live_prob.set(f"{prob:.3f} @ {ts}")
+            self.live_prob.set(f"{prob:.3f} (conf {conf:.2f}) @ {ts}")
             sig_str = "LONG" if sig == 1 else ("SHORT" if sig == -1 else "FLAT")
             self.live_signal.set(sig_str)
-            self._append_live_log(f"Prediction {ts}: prob_up={prob:.3f}, signal={sig_str}\n")
+            self._append_live_log(f"Prediction {ts}: prob_up={prob:.3f}, confidence={conf:.2f}, signal={sig_str}\n")
         elif evt == "evaluation":
             ts = msg.get("timestamp")
             correct = bool(msg.get("correct"))

@@ -9,12 +9,13 @@ import ccxt
 
 from src.run_pipeline import (
     CostModel,
-    build_features,
     build_labels,
     feature_target_split,
     train_lightgbm,
     tune_threshold_for_pnl,
 )
+# Use rich multi-timeframe features for live logic
+from src.feature_lib import build_rich_features
 
 
 @dataclass
@@ -40,6 +41,7 @@ class LiveSignalRunner:
         self._stop = False
         self._ex = None
         self._model = None
+        self._feature_names: Optional[List[str]] = None
         self._threshold = cfg.default_threshold
         self._last_pred_time: Optional[pd.Timestamp] = None
         self._pending_eval_time: Optional[pd.Timestamp] = None
@@ -59,6 +61,10 @@ class LiveSignalRunner:
 
     def _utc_now_ms(self) -> int:
         return int(pd.Timestamp.now(tz="UTC").value // 1_000_000)
+
+    def _to_local(self, ts: pd.Timestamp) -> pd.Timestamp:
+        # Convert a UTC timestamp to Sri Lanka time (Asia/Colombo, UTC+5:30)
+        return pd.Timestamp(ts).tz_convert("Asia/Colombo")
 
     def fetch_recent_minutes(self, minutes: int) -> pd.DataFrame:
         """
@@ -96,7 +102,8 @@ class LiveSignalRunner:
         if self.on_update:
             self.on_update({"event": "status", "message": f"Training live model on last {self.cfg.train_days} days..."})
         ohlcv = self.fetch_train_days(self.cfg.train_days)
-        feats = build_features(ohlcv)
+        # Use multi-timeframe rich features
+        feats = build_rich_features(ohlcv)
         labeled = build_labels(feats, self.cost)
         X, y = feature_target_split(labeled)
         # Simple split: last 10% for validation threshold tuning
@@ -116,6 +123,7 @@ class LiveSignalRunner:
         else:
             t_opt = self.cfg.default_threshold
         self._model = model
+        self._feature_names = list(X.columns)
         self._threshold = float(t_opt)
         if self.on_update:
             self.on_update({"event": "model_ready", "threshold": self._threshold})
@@ -127,18 +135,24 @@ class LiveSignalRunner:
         Returns (timestamp, prob_up, signal)
         """
         recent = self.fetch_recent_minutes(self.cfg.feature_minutes)
-        feats = build_features(recent)
+        feats = build_rich_features(recent)
         if feats.empty:
             raise RuntimeError("No features computed in live prediction.")
         # Use latest completed index
         ts = feats.index[-1]
         X_row = feats.iloc[[-1]].copy()
-        # Build feature set like in training
-        X_all, _ = feature_target_split(feats)
-        feats_cols = X_all.columns
-        X_row = X_row[feats_cols]
-        prob = float(self._model.predict(X_row, num_iteration=self._model.best_iteration)[0])
-        signal = 1 if prob > self._threshold else (-1 if prob < 1 - self._threshold else 0)
+        # Align feature columns to the trained model
+        if not self._feature_names:
+            raise RuntimeError("Model feature names are not set.")
+        for col in self._feature_names:
+            if col not in X_row.columns:
+                X_row[col] = 0.0
+        # Keep only training features (order matters)
+        X_row = X_row[self._feature_names]
+        # Predict probability of UP
+        best_it = getattr(self._model, "best_iteration", None)
+        prob = float(self._model.predict(X_row, num_iteration=best_it)[0])
+        signal = int(1 if prob > self._threshold else (-1 if prob < 1 - self._threshold else 0))
         return ts, prob, signal
 
     def _evaluate_previous(self, prev_ts: pd.Timestamp) -> Optional[bool]:
@@ -151,7 +165,7 @@ class LiveSignalRunner:
         if now <= prev_ts + pd.Timedelta(minutes=1, seconds=5):
             return None  # too soon
         recent = self.fetch_recent_minutes(self.cfg.feature_minutes)
-        feats = build_features(recent)
+        feats = build_rich_features(recent)
         lbl = build_labels(feats, self.cost)
         if prev_ts not in lbl.index:
             return None
@@ -193,7 +207,8 @@ class LiveSignalRunner:
                     res = self._evaluate_previous(self._pending_eval_time)
                     if res is not None:
                         if self.on_update:
-                            self.on_update({"event": "evaluation", "timestamp": self._pending_eval_time, "correct": res})
+                            ts_loc_eval = self._to_local(self._pending_eval_time)
+                            self.on_update({"event": "evaluation", "timestamp": str(ts_loc_eval), "correct": res})
                         self._pending_eval_time = None
                         self._pending_prob = None
 
@@ -204,12 +219,15 @@ class LiveSignalRunner:
                     self._pending_eval_time = ts
                     self._pending_prob = prob
                     if self.on_update:
+                        confidence = float(2.0 * abs(prob - 0.5))
+                        ts_loc = self._to_local(ts)
                         self.on_update({
                             "event": "prediction",
-                            "timestamp": ts,
+                            "timestamp": str(ts_loc),
                             "prob_up": prob,
+                            "confidence": confidence,
                             "signal": int(signal),
-                            "threshold": self._threshold,
+                            "threshold": float(self._threshold),
                         })
 
                 # Sleep until next minute boundary
