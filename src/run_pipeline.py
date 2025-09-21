@@ -3,7 +3,7 @@ import os
 import math
 import time
 from dataclasses import dataclass
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional, Callable
 
 import numpy as np
 import pandas as pd
@@ -37,7 +37,13 @@ def ensure_dirs():
 
 
 def utc_ms(dt: pd.Timestamp) -> int:
-    return int(pd.Timestamp(dt, tz="UTC").value // 1_000_000)
+    ts = pd.Timestamp(dt)
+    # If naive, assume UTC; if tz-aware, convert to UTC
+    if ts.tzinfo is None or ts.tz is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return int(ts.value // 1_000_000)
 
 
 def fetch_ohlcv_ccxt(symbol: str, days: int, exchange: str = "binance") -> pd.DataFrame:
@@ -49,7 +55,8 @@ def fetch_ohlcv_ccxt(symbol: str, days: int, exchange: str = "binance") -> pd.Da
     ex = ccxt.binance({"enableRateLimit": True})
     timeframe = "1m"
     limit = 1000
-    since = utc_ms(pd.Timestamp.utcnow().tz_convert("UTC") - pd.Timedelta(days=days))
+    # Use timezone-aware current time in UTC
+    since = utc_ms(pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days))
 
     all_rows: List[List[float]] = []
     while True:
@@ -77,6 +84,38 @@ def fetch_ohlcv_ccxt(symbol: str, days: int, exchange: str = "binance") -> pd.Da
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df = df.sort_values("timestamp").drop_duplicates("timestamp")
     df = df.set_index("timestamp")
+    return df
+
+
+def fetch_recent_ohlcv_ccxt(symbol: str, minutes: int, exchange: str = "binance") -> pd.DataFrame:
+    """
+    Fetch recent N minutes of OHLCV for live monitoring.
+    """
+    if exchange != "binance":
+        raise NotImplementedError("Only binance spot is implemented in this baseline.")
+    ex = ccxt.binance({"enableRateLimit": True})
+    timeframe = "1m"
+    limit = 1000
+    since = utc_ms(pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=minutes))
+
+    all_rows: List[List[float]] = []
+    while True:
+        ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
+        if not ohlcv:
+            break
+        all_rows.extend(ohlcv)
+        last_ts = ohlcv[-1][0]
+        since = last_ts + 60_000
+        time.sleep(ex.rateLimit / 1000.0)
+        if len(ohlcv) < limit:
+            break
+
+    if not all_rows:
+        raise RuntimeError("No OHLCV data fetched. Check symbol or connectivity.")
+
+    df = pd.DataFrame(all_rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df = df.sort_values("timestamp").drop_duplicates("timestamp").set_index("timestamp")
     return df
 
 
@@ -186,6 +225,15 @@ def feature_target_split(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     X = df[feats]
     y = df["label"]
     return X, y
+
+
+def final_feature_names(df: pd.DataFrame) -> List[str]:
+    exclude = {
+        "open", "high", "low", "close", "volume",
+        "label", "next_ret",
+        "minute", "hour", "dow"
+    }
+    return [c for c in df.columns if c not in exclude]
 
 
 # ----------------------------
@@ -310,6 +358,29 @@ def train_lightgbm(X_train: pd.DataFrame, y_train: pd.Series, X_val: pd.DataFram
     return model
 
 
+# ----------------------------
+# Final model for live usage
+# ----------------------------
+def train_final_model_on_all(X: pd.DataFrame, y: pd.Series) -> lgb.Booster:
+    mask = y.notna()
+    dtrain = lgb.Dataset(X[mask], label=y[mask])
+    params = dict(
+        objective="binary",
+        metric=["binary_logloss"],
+        boosting_type="gbdt",
+        num_leaves=64,
+        learning_rate=0.05,
+        feature_fraction=0.8,
+        bagging_fraction=0.8,
+        bagging_freq=1,
+        min_data_in_leaf=50,
+        verbose=-1,
+        seed=42,
+    )
+    model = lgb.train(params, dtrain, num_boost_round=800)
+    return model
+
+
 def run_pipeline(
     symbol: str,
     days: int,
@@ -317,18 +388,32 @@ def run_pipeline(
     folds: int,
     val_days: int,
     default_prob_threshold: float,
+    progress_callback: Optional[Callable[[str, float], None]] = None,
+    fold_callback: Optional[Callable[[int, Dict[str, float]], None]] = None,
 ):
+    """
+    Run the pipeline and optionally report progress via callbacks.
+
+    progress_callback: called as progress_callback(stage:str, progress:float in [0,1])
+    fold_callback: called after each fold with metrics dict.
+    """
     ensure_dirs()
 
     # 1) Data
+    if progress_callback:
+        progress_callback("Fetching OHLCV", 0.05)
     print(f"Fetching {days} days of 1m OHLCV for {symbol} from Binance...")
     ohlcv = fetch_ohlcv_ccxt(symbol, days)
     raw_path = f"data/raw/{symbol.replace('/', '')}_1m.parquet"
     ohlcv.to_parquet(raw_path)
     print(f"Saved raw OHLCV: {raw_path} ({len(ohlcv):,} rows)")
+    if progress_callback:
+        progress_callback("Building features", 0.20)
 
     # 2) Features
     feats = build_features(ohlcv)
+    if progress_callback:
+        progress_callback("Labeling", 0.30)
 
     # 3) Labels
     labeled = build_labels(feats, cost)
@@ -347,6 +432,9 @@ def run_pipeline(
         next_ret_va = labeled.loc[va_mask, "next_ret"]
 
         print(f"\nFold {i}: train {tr_s} to {tr_e} ({len(X_tr):,} rows), validate {va_s} to {va_e} ({len(X_va):,} rows)")
+        if progress_callback:
+            # Allocate 0.7 budget to folds
+            progress_callback(f"Training fold {i}", 0.30 + 0.7 * (i - 1) / max(len(windows), 1))
 
         if y_tr.notna().sum() < 1000 or y_va.notna().sum() < 500:
             print("Insufficient labeled samples for this fold; skipping.")
@@ -379,22 +467,25 @@ def run_pipeline(
         pf = profit_factor(sim["pnl"])
         expectancy = sim["pnl"].mean()
 
-        summary_rows.append(
-            dict(
-                fold=i,
-                threshold=t_opt,
-                auc=auc,
-                accuracy=acc,
-                expectancy=expectancy,
-                sharpe=sharpe,
-                max_drawdown=mdd,
-                profit_factor=pf,
-                trades=(sim["signal"] != 0).sum(),
-                samples=len(sim),
-            )
+        metrics = dict(
+            fold=i,
+            threshold=t_opt,
+            auc=auc,
+            accuracy=acc,
+            expectancy=expectancy,
+            sharpe=sharpe,
+            max_drawdown=mdd,
+            profit_factor=pf,
+            trades=int((sim["signal"] != 0).sum()),
+            samples=int(len(sim)),
         )
+        summary_rows.append(metrics)
+        if fold_callback:
+            fold_callback(i, metrics)
 
         all_val_frames.append(sim)
+        if progress_callback:
+            progress_callback(f"Completed fold {i}", 0.30 + 0.7 * (i) / max(len(windows), 1))
 
     if not all_val_frames:
         raise RuntimeError("No validation results produced. Try increasing days or reducing folds/val_days.")
@@ -416,6 +507,11 @@ def run_pipeline(
     print(f"- Sharpe: {sharpe_ratio(results['pnl']):.3f}")
     print(f"- Profit factor: {profit_factor(results['pnl']):.3f}")
     print(f"- Max drawdown (cum PnL units): {max_drawdown(results['pnl'].cumsum()):.6f}")
+
+    if progress_callback:
+        progress_callback("Done", 1.0)
+
+    return results, summary, out_csv
 
 
 def parse_args():
