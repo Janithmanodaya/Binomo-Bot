@@ -144,8 +144,12 @@ class LiveSignalRunner:
         for col in self._feature_names:
             if col not in X_row.columns:
                 X_row[col] = 0.0
+        # Keep only training features (order matters)
         X_row = X_row[self._feature_names]
-        problf._threshold else 0)
+        # Predict probability of UP
+        best_it = getattr(self._model, "best_iteration", None)
+        prob = float(self._model.predict(X_row, num_iteration=best_it)[0])
+        signal = int(1 if prob > self._threshold else (-1 if prob < 1 - self._threshold else 0))
         return ts, prob, signal
 
     def _evaluate_previous(self, prev_ts: pd.Timestamp) -> Optional[bool]:
@@ -200,7 +204,7 @@ class LiveSignalRunner:
                     res = self._evaluate_previous(self._pending_eval_time)
                     if res is not None:
                         if self.on_update:
-                            self.on_update({"event": "evaluation", "timestamp": self._pending_eval_time, "correct": res})
+                            self.on_update({"event": "evaluation", "timestamp": str(self._to_local(self._pending_eval_time)), "correct": res})
                         self._pending_eval_time = None
                         self._pending_prob = None
 
@@ -211,13 +215,16 @@ class LiveSignalRunner:
                     self._pending_eval_time = ts
                     self._pending_prob = prob
                     if self.on_update:
+                        confidence = 2.0 * abs(prob - 0.5)
+                        ts_loc = ts.tz_convert("Asia/Colombo")
                         self.on_update({
                             "event": "prediction",
                             "timestamp": ts,
+                            "timestamp_local": ts_loc,
                             "prob_up": prob,
+                            "confidence": confidence,
                             "signal": int(signal),
-                            "threshold": self._threshold,
-                        })
+                            "threshold })
 
                 # Sleep until next minute boundary
                 now = pd.Timestamp.now(tz="UTC")
