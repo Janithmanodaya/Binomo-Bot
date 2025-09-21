@@ -87,6 +87,38 @@ def fetch_ohlcv_ccxt(symbol: str, days: int, exchange: str = "binance") -> pd.Da
     return df
 
 
+def fetch_recent_ohlcv_ccxt(symbol: str, minutes: int, exchange: str = "binance") -> pd.DataFrame:
+    """
+    Fetch recent N minutes of OHLCV for live monitoring.
+    """
+    if exchange != "binance":
+        raise NotImplementedError("Only binance spot is implemented in this baseline.")
+    ex = ccxt.binance({"enableRateLimit": True})
+    timeframe = "1m"
+    limit = 1000
+    since = utc_ms(pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=minutes))
+
+    all_rows: List[List[float]] = []
+    while True:
+        ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
+        if not ohlcv:
+            break
+        all_rows.extend(ohlcv)
+        last_ts = ohlcv[-1][0]
+        since = last_ts + 60_000
+        time.sleep(ex.rateLimit / 1000.0)
+        if len(ohlcv) < limit:
+            break
+
+    if not all_rows:
+        raise RuntimeError("No OHLCV data fetched. Check symbol or connectivity.")
+
+    df = pd.DataFrame(all_rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df = df.sort_values("timestamp").drop_duplicates("timestamp").set_index("timestamp")
+    return df
+
+
 # ----------------------------
 # Feature Engineering
 # ----------------------------
@@ -193,6 +225,15 @@ def feature_target_split(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     X = df[feats]
     y = df["label"]
     return X, y
+
+
+def final_feature_names(df: pd.DataFrame) -> List[str]:
+    exclude = {
+        "open", "high", "low", "close", "volume",
+        "label", "next_ret",
+        "minute", "hour", "dow"
+    }
+    return [c for c in df.columns if c not in exclude]
 
 
 # ----------------------------
@@ -314,6 +355,29 @@ def train_lightgbm(X_train: pd.DataFrame, y_train: pd.Series, X_val: pd.DataFram
             lgb.log_evaluation(period=100),
         ],
     )
+    return model
+
+
+# ----------------------------
+# Final model for live usage
+# ----------------------------
+def train_final_model_on_all(X: pd.DataFrame, y: pd.Series) -> lgb.Booster:
+    mask = y.notna()
+    dtrain = lgb.Dataset(X[mask], label=y[mask])
+    params = dict(
+        objective="binary",
+        metric=["binary_logloss"],
+        boosting_type="gbdt",
+        num_leaves=64,
+        learning_rate=0.05,
+        feature_fraction=0.8,
+        bagging_fraction=0.8,
+        bagging_freq=1,
+        min_data_in_leaf=50,
+        verbose=-1,
+        seed=42,
+    )
+    model = lgb.train(params, dtrain, num_boost_round=800)
     return model
 
 
