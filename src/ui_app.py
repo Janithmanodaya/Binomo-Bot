@@ -1,11 +1,11 @@
 import os
 import time
 from typing import Dict, List, Optional
-import numpy as np
 
+import numpy as np
 import pandas as pd
-import streamlit as st
 import plotly.express as px
+import streamlit as st
 
 # Ensure project root is on sys.path so `from src...` works when running as a script inside src/
 try:
@@ -180,7 +180,7 @@ with tabs[1]:
             ph_status = st.empty()
             ph_metrics = st.empty()
             ph_table = st.empty()
-            rows = []
+            rows: List[Dict] = []
 
             for i in range(int(rt_minutes)):
                 # Fetch recent candles (limit 800) without 'since' to get the freshest bars
@@ -247,36 +247,40 @@ with tabs[1]:
                         correct = bool(next_ret > tau)
                         pnl = float(next_ret - tau)
                     elif signal == -1:
-                        correct = bool(next_re <p -tau)
+                        correct = bool(next_ret < -tau)
                         pnl = float(-next_ret - tau)
                     else:
-                                        pnl = 0.0
+                        correct = bool(abs(next_ret) <= tau)
+                        pnl = 0.0
 
-                    # mark eligibility by confidence threshold and non-flat signal
-                    eligible = bool((signal != 0) and (confidence >= min_conf))
+                    eligible = (signal != 0) and (confidence >= min_conf)
+
+                    # Update last row with evaluation
                     rows[-1]["next_ret"] = next_ret
-                    rows[-1]["correct"] = bool(correct)
-                    rows[-1]["eligible"] = eligible
-                    rows[-1]["pnl"] = float(pnl)
+                    rows[-1]["correct"] = correct
+                    rows[-1]["eligible"] = bool(eligible)
+                    rows[-1]["pnl"] = pnl
 
-                    # Update metrics on eligible trades
+                    # Build DataFrame and compute summary metrics
                     df_rows = pd.DataFrame(rows)
-                    df_elig = df_rows[(df_rows.get("eligible", False) == True)]
-                    total = int(len(df_rows))
-                    trades = int((df_rows["signal"] != 0).sum()) if "signal" in df_rows else 0
+                    if "eligible" in df_rows.columns:
+                        df_elig = df_rows[df_rows["eligible"] == True]
+                    else:
+                        df_elig = pd.DataFrame(columns=df_rows.columns)
+
+                    trades = int((df_rows["signal"] != 0).sum()) if "signal" in df_rows.columns else 0
                     elig_trades = int(len(df_elig))
-                    wins = int(df_elig["correct"].sum()) if "correct" in df_elig else 0
-                    win_rate = (wins / max(elig_trades, 1)) if elig_trades > 0 else 0.0
-                    cum_pnl = float(df_elig.get("pnl", pd.Series(dtype=float)).sum()) if elig_trades > 0 else 0.0
+                    wins = int(df_elig["correct"].sum()) if ("correct" in df_elig.columns and elig_trades > 0) else 0
+                    win_rate = (wins / elig_trades) if elig_trades > 0 else 0.0
+                    cum_pnl = float(df_elig["pnl"].sum()) if ("pnl" in df_elig.columns and elig_trades > 0) else 0.0
 
                     with ph_metrics.container():
                         mc1, mc2, mc3, mc4 = st.columns(4)
                         mc1.metric("Eligible trades", f"{elig_trades}")
-                        mc2.metric("Win rate (eligible)", f"{win_rate*100:.1f}%")
+                        mc2.metric("Win rate (eligible)", f"{win_rate * 100:.1f}%")
                         mc3.metric("Cum PnL (eligible)", f"{cum_pnl:.3e}")
                         mc4.metric("All signals", f"{trades}")
 
-                    # Show latest table (tail)
                     ph_table.dataframe(df_rows.tail(50), use_container_width=True)
 
             # Save preview to CSV
