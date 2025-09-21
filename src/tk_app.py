@@ -108,8 +108,6 @@ class LiveApp(tk.Tk):
 
         spin_thr = ttk.Spinbox(cfg, from_=0.00, to=0.90, increment=0.01, textvariable=self.adv_threshold_var)
         add_row(cfg, 10, "Advanced live threshold (0=auto):", spin_thr)
-        add_row(cfg, 9, "Backtest holdout days:", ttk.Spinbox(cfg, from_=0, to=60, increment=1, textvariable=self.adv_backtest_days_var))
-        add_row(cfg, 10, "Advanced live threshold (0=auto):", ttk.Spinbox(cfg, from_=0.00, to=0.90, increment=0.01, textvariable=self.adv_threshold_v_codearnew)</)
 
         # Controls
         btns = ttk.Frame(frm)
