@@ -4,12 +4,12 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
+import plotly.express as px  # still used for any plots if needed later
 import streamlit as st
 
 # Ensure project root is on sys.path so `from src...` works when running as a script inside src/
 try:
-    from src.run_pipeline import CostModel, run_pipeline  # type: ignore
+    from src.run_pipeline import CostModel  # type: ignore
     from src.realtime_pipeline import train_model as train_realtime_model  # type: ignore
     from src.advanced_trainer import train_multilevel_model, load_advanced_bundle, predict_latest  # type: ignore
 except Exception:
@@ -18,7 +18,7 @@ except Exception:
     ROOT = Path(__file__).resolve().parents[1]
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
-    from src.run_pipeline import CostModel, run_pipeline  # type: ignore
+    from src.run_pipeline import CostModel  # type: ignore
     from src.realtime_pipeline import train_model as train_realtime_model  # type: ignore
     from src.advanced_trainer import train_multilevel_model, load_advanced_bundle, predict_latest  # type: ignore
 
@@ -26,11 +26,11 @@ from src.features_ta import build_rich_features  # type: ignore
 import lightgbm as lgb  # type: ignore
 
 
-st.set_page_config(page_title="Crypto Baseline Trainer", layout="wide")
-st.title("Cost-aware 1m Crypto Direction — Trainer & Dashboard")
+st.set_page_config(page_title="Live Crypto Signal — Realtime + Advanced", layout="wide")
+st.title("Live Crypto Signal — Realtime + Advanced (cost-aware)")
 
 # Build/version banner to verify UI is up to date
-UI_VERSION = "v0.3.0 (advanced multi-level live + progress)"
+UI_VERSION = "v0.4.0 (live-only UI)"
 try:
     mtime = os.path.getmtime(__file__)
     ts = pd.to_datetime(mtime, unit="s")
@@ -38,105 +38,10 @@ try:
 except Exception:
     st.caption(f"UI build: {UI_VERSION}")
 
-tabs = st.tabs(["Backtest", "Realtime (rich)", "Live (advanced)"])
+tabs = st.tabs(["Realtime (rich)", "Live (advanced)"])
 
-# ----------------------------- Backtest tab -----------------------------
+# ----------------------------- Realtime (rich) tab -----------------------------
 with tabs[0]:
-    with st.sidebar:
-        st.header("Backtest configuration")
-        symbol = st.text_input("Symbol (Binance spot)", value="ETH/USDT", key="bt_symbol")
-        days = st.number_input("Lookback days", min_value=10, max_value=365, value=60, step=5, key="bt_days")
-        taker_fee_bps = st.number_input("Taker fee per side (bps)", min_value=0.0, max_value=50.0, value=4.0, step=0.5, key="bt_fee")
-        slippage_bps = st.number_input("Slippage per side (bps)", min_value=0.0, max_value=50.0, value=1.0, step=0.5, key="bt_slip")
-        folds = st.number_input("Walk-forward folds", min_value=1, max_value=20, value=5, step=1, key="bt_folds")
-        val_days = st.number_input("Validation days per fold", min_value=1, max_value=60, value=10, step=1, key="bt_valdays")
-        prob_threshold = st.slider("Default decision threshold", min_value=0.50, max_value=0.80, value=0.55, step=0.01, key="bt_thresh")
-
-        st.markdown("---")
-        run_btn = st.button("Run Training", type="primary", key="bt_run")
-
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    fold_metrics_placeholder = st.empty()
-    results_placeholder = st.empty()
-
-    def on_progress(stage: str, p: float):
-        status_text.text(f"{stage} ... ({int(p*100)}%)")
-        progress_bar.progress(min(max(p, 0.0), 1.0))
-
-    def on_fold(fold: int, metrics: Dict[str, float]):
-        with fold_metrics_placeholder.container():
-            st.subheader(f"Fold {fold} metrics")
-            cols = st.columns(6)
-            cols[0].metric("AUC", f"{metrics['auc']:.3f}")
-            cols[1].metric("Accuracy", f"{metrics['accuracy']:.3f}")
-            cols[2].metric("Expectancy", f"{metrics['expectancy']:.3e}")
-            cols[3].metric("Sharpe", f"{metrics['sharpe']:.2f}")
-            cols[4].metric("Profit factor", f"{metrics['profit_factor']:.2f}")
-            cols[5].metric("Trades", f"{metrics['trades']}")
-
-    if run_btn:
-        try:
-            cost = CostModel(taker_fee_bps=taker_fee_bps, slippage_bps=slippage_bps)
-            results, summary, out_csv = run_pipeline(
-                symbol=symbol,
-                days=int(days),
-                cost=cost,
-                folds=int(folds),
-                val_days=int(val_days),
-                default_prob_threshold=float(prob_threshold),
-                progress_callback=on_progress,
-                fold_callback=on_fold,
-            )
-            progress_bar.progress(1.0)
-            status_text.success(f"Training complete. Results saved to {out_csv}")
-
-            with results_placeholder.container():
-                st.subheader("Performance Report")
-
-                # Cumulative PnL
-                cum = results["pnl"].cumsum()
-                fig = px.line(cum, title="Cumulative PnL (validation folds)", labels={"value": "PnL", "index": "Timestamp"})
-                st.plotly_chart(fig, use_container_width=True)
-
-                # Trades per minute
-                trades_per_day = (results["signal"] != 0).resample("1D").sum()
-                fig2 = px.bar(trades_per_day, title="Trades per day", labels={"value": "Trades", "index": "Day"})
-                st.plotly_chart(fig2, use_container_width=True)
-
-                # Summary table
-                st.subheader("Per-fold summary")
-                st.dataframe(summary.round(6), use_container_width=True)
-
-                # Download links
-                st.download_button(
-                    label="Download predictions.csv",
-                    data=open(out_csv, "rb").read(),
-                    file_name="predictions.csv",
-                    mime="text/csv",
-                )
-
-                # Show head of detailed results
-                st.subheader("Sample of per-minute results")
-                st.dataframe(results.head(200), use_container_width=True)
-
-        except Exception as e:
-            st.error(f"Error: {e}")
-    else:
-        # If predictions already exist, allow quick visualization without re-running
-        default_path = "data/processed/predictions.csv"
-        if os.path.exists(default_path):
-            try:
-                results = pd.read_csv(default_path, parse_dates=["timestamp"]).set_index("timestamp")
-                st.info("Found existing results at data/processed/predictions.csv")
-                cum = results["pnl"].cumsum()
-                fig = px.line(cum, title="Cumulative PnL (existing results)", labels={"value": "PnL", "index": "Timestamp"})
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception:
-                pass
-
-# ----------------------------- Realtime tab -----------------------------
-with tabs[1]:
     st.subheader("Realtime predictions with rich multi-timeframe features")
     colA, colB, colC = st.columns(3)
     rt_symbol = colA.text_input("Symbol", value="ETH/USDT", key="rt_symbol")
@@ -309,7 +214,7 @@ with tabs[1]:
             st.error(f"Realtime preview error: {e}")
 
 # ----------------------------- Advanced Live tab -----------------------------
-with tabs[2]:
+with tabs[1]:
     st.subheader("Live (advanced): multi-level signals with training progress")
     colA, colB, colC = st.columns(3)
     adv_symbol = colA.text_input("Symbol", value="ETH/USDT", key="adv_symbol")
