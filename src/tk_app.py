@@ -8,10 +8,14 @@ from typing import Dict, Optional, Callable
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
+# Ensure project root is on sys.path so `from src...` works regardless of CWD
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 # Live components
 from src.live_signal import LiveConfig, LiveSignalRunner  # type: ignore
 
-# Ensure project root is on sys.path so `from src...` works regardless of CWD
 try:
     from src.run_pipeline import (
         CostModel,
@@ -24,9 +28,19 @@ try:
         train_final_model_on_all,
     )  # type: ignore
 except Exception:
-    ROOT = Path(__file__).resolve().parents[1]
+    # As a fallback, ensure ROOT is present (should already be)
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
+    from src.run_pipeline import (  # type: ignore
+        CostModel,
+        run_pipeline,
+        fetch_recent_ohlcv_ccxt,
+        build_features,
+        build_labels,
+        feature_target_split,
+        final_feature_names,
+        train_final_model_on_all,
+    )
     from src.run_pipeline import (  # type: ignore
         CostModel,
         run_pipeline,
@@ -62,7 +76,147 @@ class TrainerApp(tk.Tk):
         self._worker: Optional[threading.Thread] = None
         self._stop_flag = threading.Event()
 
-        # Liveout)
+        # Live runner state
+        self._live_thread: Optional[threading.Thread] = None
+        self._live_runner = None
+        self._live_stop = threading.Event()
+
+        # Build UI and start polling logs
+        try:
+            self._build_ui()
+        except Exception as e:
+            # If any UI build error occurs, render a minimal message so the window isn't empty
+            holder = ttk.Frame(self, padding=12)
+            holder.pack(fill=tk.BOTH, expand=True)
+            ttk.Label(holder, text=f"UI error: {e}").pack(anchor="w")
+        self.after(100, self._poll_stdout)
+
+    def _build_ui(self):
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        nb = ttk.Notebook(frm)
+        nb.pack(fill=tk.BOTH, expand=True)
+
+        # --------- Tab: Backtest ----------
+        tab_backtest = ttk.Frame(nb)
+        nb.add(tab_backtest, text="Backtest")
+
+        cfg = ttk.LabelFrame(tab_backtest, text="Configuration", padding=10)
+        cfg.pack(fill=tk.X)
+
+        self.symbol_var = tk.StringVar(value="ETH/USDT")
+        self.days_var = tk.IntVar(value=60)
+        self.taker_var = tk.DoubleVar(value=4.0)
+        self.slip_var = tk.DoubleVar(value=1.0)
+        self.folds_var = tk.IntVar(value=5)
+        self.valdays_var = tk.IntVar(value=10)
+        self.threshold_var = tk.DoubleVar(value=0.55)
+
+        def add_row(parent, r, label, widget):
+            ttk.Label(parent, text=label, width=28).grid(row=r, column=0, sticky="w", padx=4, pady=3)
+            widget.grid(row=r, column=1, sticky="we", padx=4, pady=3)
+
+        cfg.columnconfigure(1, weight=1)
+        add_row(cfg, 0, "Symbol (Binance spot):", ttk.Entry(cfg, textvariable=self.symbol_var))
+        add_row(cfg, 1, "Lookback days:", ttk.Spinbox(cfg, from_=10, to=365, textvariable=self.days_var, increment=5))
+        add_row(cfg, 2, "Taker fee per side (bps):", ttk.Spinbox(cfg, from_=0.0, to=50.0, increment=0.5, textvariable=self.taker_var))
+        add_row(cfg, 3, "Slippage per side (bps):", ttk.Spinbox(cfg, from_=0.0, to=50.0, increment=0.5, textvariable=self.slip_var))
+        add_row(cfg, 4, "Walk-forward folds:", ttk.Spinbox(cfg, from_=1, to=20, textvariable=self.folds_var))
+        add_row(cfg, 5, "Validation days per fold:", ttk.Spinbox(cfg, from_=1, to=60, textvariable=self.valdays_var))
+        add_row(cfg, 6, "Default decision threshold:", ttk.Spinbox(cfg, from_=0.50, to=0.80, increment=0.01, textvariable=self.threshold_var))
+
+        btns = ttk.Frame(tab_backtest)
+        btns.pack(fill=tk.X, pady=(8, 4))
+        self.start_btn = ttk.Button(btns, text="Run Training", command=self.start_training)
+        self.start_btn.pack(side=tk.LEFT)
+        self.stop_btn = ttk.Button(btns, text="Stop", command=self.stop_training, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.open_out_btn = ttk.Button(btns, text="Open predictions.csv", command=self.open_output, state=tk.DISABLED)
+        self.open_out_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        prog = ttk.Frame(tab_backtest)
+        prog.pack(fill=tk.X, pady=(4, 8))
+        self.status_var = tk.StringVar(value="Idle")
+        self.status_lbl = ttk.Label(prog, textvariable=self.status_var)
+        self.status_lbl.pack(side=tk.LEFT)
+        self.progress = ttk.Progressbar(prog, orient="horizontal", mode="determinate", maximum=100)
+        self.progress.pack(fill=tk.X, expand=True, padx=(8, 0))
+
+        logf = ttk.LabelFrame(tab_backtest, text="Logs", padding=6)
+        logf.pack(fill=tk.BOTH, expand=True)
+        self.log = tk.Text(logf, wrap="word", height=25)
+        self.log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(logf, orient="vertical", command=self.log.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log.configure(yscrollcommand=sb.set)
+
+        self.footer = ttk.Label(tab_backtest, text="Predictions: (not generated yet)")
+        self.footer.pack(fill=tk.X, pady=(6, 0))
+
+        # --------- Tab: Live ----------
+        tab_live = ttk.Frame(nb)
+        nb.add(tab_live, text="Live")
+
+        live_cfg = ttk.LabelFrame(tab_live, text="Live configuration", padding=10)
+        live_cfg.pack(fill=tk.X)
+
+        self.live_train_days = tk.IntVar(value=7)
+        self.live_feat_minutes = tk.IntVar(value=2000)
+        self.live_default_thresh = tk.DoubleVar(value=0.55)
+
+        add_row(live_cfg, 0, "Symbol (Binance spot):", ttk.Entry(live_cfg, textvariable=self.symbol_var))
+        add_row(live_cfg, 1, "Train days (history):", ttk.Spinbox(live_cfg, from_=2, to=90, textvariable=self.live_train_days))
+        add_row(live_cfg, 2, "Feature minutes (recent):", ttk.Spinbox(live_cfg, from_=500, to=5000, increment=100, textvariable=self.live_feat_minutes))
+        add_row(live_cfg, 3, "Default decision threshold:", ttk.Spinbox(live_cfg, from_=0.50, to=0.80, increment=0.01, textvariable=self.live_default_thresh))
+
+        live_btns = ttk.Frame(tab_live)
+        live_btns.pack(fill=tk.X, pady=(8, 4))
+        self.live_start = ttk.Button(live_btns, text="Start Live", command=self.start_live)
+        self.live_start.pack(side=tk.LEFT)
+        self.live_stop = ttk.Button(live_btns, text="Stop Live", command=self.stop_live, state=tk.DISABLED)
+        self.live_stop.pack(side=tk.LEFT, padx=(8, 0))
+
+        live_stats = ttk.LabelFrame(tab_live, text="Live status", padding=10)
+        live_stats.pack(fill=tk.X)
+        self.live_status = tk.StringVar(value="Idle")
+        self.live_prob = tk.StringVar(value="—")
+        self.live_signal = tk.StringVar(value="—")
+        self.live_eval = tk.StringVar(value="—")
+
+        ttk.Label(live_stats, text="Status:", width=18).grid(row=0, column=0, sticky="w")
+        ttk.Label(live_stats, textvariable=self.live_status).grid(row=0, column=1, sticky="w")
+        ttk.Label(live_stats, text="Prob(up):", width=18).grid(row=1, column=0, sticky="w")
+        ttk.Label(live_stats, textvariable=self.live_prob).grid(row=1, column=1, sticky="w")
+        ttk.Label(live_stats, text="Signal:", width=18).grid(row=2, column=0, sticky="w")
+        ttk.Label(live_stats, textvariable=self.live_signal).grid(row=2, column=1, sticky="w")
+        ttk.Label(live_stats, text="Last evaluation:", width=18).grid(row=3, column=0, sticky="w")
+        ttk.Label(live_stats, textvariable=self.live_eval).grid(row=3, column=1, sticky="w")
+
+        live_logf = ttk.LabelFrame(tab_live, text="Live logs", padding=6)
+        live_logf.pack(fill=tk.BOTH, expand=True)
+        self.live_log = tk.Text(live_logf, wrap="word", height=20)
+        self.live_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        lsb = ttk.Scrollbar(live_logf, orient="vertical", command=self.live_log.yview)
+        lsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.live_log.configure(yscrollcommand=lsb.set)
+
+    def _append_log(self, text: str):
+        self.log.insert(tk.END, text)
+        self.log.see(tk.END)
+
+    def _append_live_log(self, text: str):
+        self.live_log.insert(tk.END, text)
+        self.live_log.see(tk.END)
+
+    def _poll_stdout(self):
+        try:
+            while True:
+                s = self._stdout_queue.get_nowait()
+                self._append_log(s)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_stdout)
 
     def _build_ui(self):
         frm = ttk.Frame(self, padding=10)
