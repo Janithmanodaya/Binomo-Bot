@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, Optional, List
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 import numpy as np
 import pandas as pd
@@ -46,6 +46,9 @@ class LiveApp(tk.Tk):
         self._live_runner = None
         self._stop_event = threading.Event()
 
+        # Advanced model bundle (if loaded or trained)
+        self._adv_bundle: Optional[Dict] = None
+
         # Virtual orders
         self._min_conf_var = tk.DoubleVar(value=0.30)
         self._pending_trade: Optional[Dict] = None  # keyed by last prediction
@@ -53,10 +56,7 @@ class LiveApp(tk.Tk):
 
         # Build UI
         try:
-            self._build_ui()
-        except Exception as e:
-            holder = ttk.Frame(self, padding=12)
-            holder.pack(fill=tk.BOTH, expand=True)
+            self holder.pack(fill=tk.BOTH, expand=True)
             ttk.Label(holder, text=f"UI error: {e}").pack(anchor="w")
 
     def _build_ui(self):
@@ -100,6 +100,12 @@ class LiveApp(tk.Tk):
         self.live_stop.pack(side=tk.LEFT, padx=(8, 0))
         self.save_trades_btn = ttk.Button(btns, text="Save Trades CSV", command=self.save_trades_csv)
         self.save_trades_btn.pack(side=tk.RIGHT)
+
+        # Advanced model actions
+        adv_btns = ttk.Frame(frm)
+        adv_btns.pack(fill=tk.X, pady=(0, 8))
+        self.train_adv_btn = ttk.Button(adv_btns, text="Train Advanced Now", command=self.train_advanced_now)
+        self.train_adv_btn.pack(side=tk)
 
         # Training progress
         progf = ttk.LabelFrame(frm, text="Training progress", padding=10)
@@ -247,6 +253,98 @@ class LiveApp(tk.Tk):
         except Exception as e:
             messagebox.showerror("Save Trades", str(e))
 
+    # ---------------- Advanced actions (train/load/history) ----------------
+    def train_advanced_now(self):
+        symbol = self.symbol_var.get()
+        days = int(self.live_train_days.get())
+        cost = CostModel(
+            taker_fee_bps=float(self.taker_var.get()),
+            slippage_bps=float(self.slip_var.get()),
+        )
+        self.train_adv_btn.configure(state=tk.DISABLED)
+        try:
+            def on_prog(stage: str, p: float):
+                self._update_train_progress(stage, p)
+                self.live_status.set(stage)
+            self._update_train_progress("Starting training", 0.0)
+            train_multilevel_model(symbol, days, cost, progress=on_prog)
+            self._adv_bundle = load_advanced_bundle()
+            if self._adv_bundle is None:
+                raise RuntimeError("Advanced model files not found after training.")
+            thr = float(self._adv_bundle["meta"].get("threshold", float(self.live_default_thresh.get())))
+            self.train_progress["value"] = 100
+            self.train_status.set("Training complete")
+            self.live_status.set(f"Model ready (threshold={thr:.2f})")
+            self._append_live_log("Advanced model trained and loaded.\n")
+        except Exception as e:
+            messagebox.showerror("Advanced Training", str(e))
+            self._append_live_log(f"Advanced training error: {e}\n")
+            self.live_status.set("Training error")
+        finally:
+            self.train_adv_btn.configure(state=tk.NORMAL)
+
+    def load_advanced_model_dialog(self):
+        try:
+            model_path = filedialog.askopenfilename(
+                title="Select LightGBM model file",
+                filetypes=[("LightGBM model", "*.txt"), ("All files", "*.*")]
+            )
+            if not model_path:
+                return
+            meta_path = filedialog.askopenfilename(
+                title="Select meta JSON file",
+                filetypes=[("JSON", "*.json"), ("All files", "*.*")]
+            )
+            if not meta_path:
+                return
+            import json
+            import lightgbm as lgb  # type: ignore
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            booster = lgb.Booster(model_file=model_path)
+            self._adv_bundle = {"booster": booster, "meta": meta}
+            thr = float(meta.get("threshold", float(self.live_default_thresh.get())))
+            self.live_status.set(f"Loaded model (threshold={thr:.2f})")
+            self._append_live_log(f"Loaded model:\n- model: {model_path}\n- meta: {meta_path}\n")
+        except Exception as e:
+            messagebox.showerror("Load Model", str(e))
+
+    def download_history_now(self):
+        try:
+            symbol = self.symbol_var.get()
+            days = int(self.live_train_days.get())
+            self.live_status.set(f"Downloading {days} days for {symbol} ...")
+            self._append_live_log(f"Downloading history: {symbol}, {days} days\n")
+            import ccxt
+            ex = ccxt.binance({"enableRateLimit": True})
+            timeframe = "1m"
+            limit = 1000
+            since = int((pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)).timestamp() * 1000)
+            rows: List[List[float]] = []
+            while True:
+                ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
+                if not ohlcv:
+                    break
+                rows.extend(ohlcv)
+                since = ohlcv[-1][0] + 60_000
+                time.sleep(ex.rateLimit / 1000.0)
+                if len(ohlcv) < limit:
+                    break
+            if not rows:
+                raise RuntimeError("No OHLCV data fetched.")
+            df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+            df = df.set_index("timestamp").sort_index().drop_duplicates()
+            os.makedirs("data/raw", exist_ok=True)
+            suffix = f"{symbol.replace('/', '')}_{days}d_1m.parquet"
+            out_path = os.path.join("data", "raw", suffix)
+            df.to_parquet(out_path)
+            self._append_live_log(f"Saved history to: {out_path} ({len(df):,} rows)\n")
+            self.live_status.set("Download complete")
+        except Exception as e:
+            messagebox.showerror("Download History", str(e))
+            self.live_status.set("Download error")
+
     # ---------------- Live actions ----------------
     def _on_live_update(self, msg: Dict[str, object]):
         evt = msg.get("event")
@@ -338,29 +436,32 @@ class LiveApp(tk.Tk):
                 slippage_bps=float(self.slip_var.get()),
             )
 
-            # Train or refresh advanced model with progress
-            def on_prog(stage: str, p: float):
-                self._update_train_progress(stage, p)
-                self.live_status.set(stage)
+            # Train or use loaded advanced model with progress
+            if self._adv_bundle is None:
+                def on_prog(stage: str, p: float):
+                    self._update_train_progress(stage, p)
+                    self.live_status.set(stage)
 
-            self._update_train_progress("Starting training", 0.0)
-            try:
-                train_multilevel_model(symbol, days, cost, progress=on_prog)
-            except Exception as e:
-                self._append_live_log(f"Advanced training error: {e}\n")
-                self.live_status.set("Training error")
-                return
+                self._update_train_progress("Starting training", 0.0)
+                try:
+                    train_multilevel_model(symbol, days, cost, progress=on_prog)
+                except Exception as e:
+                    self._append_live_log(f"Advanced training error: {e}\n")
+                    self.live_status.set("Training error")
+                    return
 
-            bundle = load_advanced_bundle()
-            if bundle is None:
-                self._append_live_log("No advanced model found after training.\n")
-                self.live_status.set("Error")
-                return
+                self._adv_bundle = load_advanced_bundle()
+                if self._adv_bundle is None:
+                    self._append_live_log("No advanced model found after training.\n")
+                    self.live_status.set("Error")
+                    return
+                self.train_progress["value"] = 100
+                self.train_status.set("Training complete")
+            else:
+                self._append_live_log("Using loaded advanced model bundle.\n")
 
-            # Trained and ready
+            bundle = self._adv_bundle
             thr = float(bundle["meta"].get("threshold", float(self.live_default_thresh.get())))
-            self.train_progress["value"] = 100
-            self.train_status.set("Training complete")
             self.live_status.set(f"Model ready (threshold={thr:.2f})")
 
             # Live prediction loop
