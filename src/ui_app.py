@@ -4,31 +4,33 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
+import plotly.express as px  # still used for any plots if needed later
 import streamlit as st
 
 # Ensure project root is on sys.path so `from src...` works when running as a script inside src/
 try:
-    from src.run_pipeline import CostModel, run_pipeline  # type: ignore
+    from src.run_pipeline import CostModel  # type: ignore
     from src.realtime_pipeline import train_model as train_realtime_model  # type: ignore
+    from src.advanced_trainer import train_multilevel_model, load_advanced_bundle, predict_latest  # type: ignore
 except Exception:
     import sys
     from pathlib import Path
     ROOT = Path(__file__).resolve().parents[1]
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
-    from src.run_pipeline import CostModel, run_pipeline  # type: ignore
+    from src.run_pipeline import CostModel  # type: ignore
     from src.realtime_pipeline import train_model as train_realtime_model  # type: ignore
+    from src.advanced_trainer import train_multilevel_model, load_advanced_bundle, predict_latest  # type: ignore
 
 from src.features_ta import build_rich_features  # type: ignore
 import lightgbm as lgb  # type: ignore
 
 
-st.set_page_config(page_title="Crypto Baseline Trainer", layout="wide")
-st.title("Cost-aware 1m Crypto Direction — Trainer & Dashboard")
+st.set_page_config(page_title="Live Crypto Signal — Realtime + Advanced", layout="wide")
+st.title("Live Crypto Signal — Realtime + Advanced (cost-aware)")
 
 # Build/version banner to verify UI is up to date
-UI_VERSION = "v0.2.3 (live-eval + confidence filter)"
+UI_VERSION = "v0.4.0 (live-only UI)"
 try:
     mtime = os.path.getmtime(__file__)
     ts = pd.to_datetime(mtime, unit="s")
@@ -36,105 +38,10 @@ try:
 except Exception:
     st.caption(f"UI build: {UI_VERSION}")
 
-tabs = st.tabs(["Backtest", "Realtime (rich)"])
+tabs = st.tabs(["Realtime (rich)", "Live (advanced)"])
 
-# ----------------------------- Backtest tab -----------------------------
+# ----------------------------- Realtime (rich) tab -----------------------------
 with tabs[0]:
-    with st.sidebar:
-        st.header("Backtest configuration")
-        symbol = st.text_input("Symbol (Binance spot)", value="ETH/USDT", key="bt_symbol")
-        days = st.number_input("Lookback days", min_value=10, max_value=365, value=60, step=5, key="bt_days")
-        taker_fee_bps = st.number_input("Taker fee per side (bps)", min_value=0.0, max_value=50.0, value=4.0, step=0.5, key="bt_fee")
-        slippage_bps = st.number_input("Slippage per side (bps)", min_value=0.0, max_value=50.0, value=1.0, step=0.5, key="bt_slip")
-        folds = st.number_input("Walk-forward folds", min_value=1, max_value=20, value=5, step=1, key="bt_folds")
-        val_days = st.number_input("Validation days per fold", min_value=1, max_value=60, value=10, step=1, key="bt_valdays")
-        prob_threshold = st.slider("Default decision threshold", min_value=0.50, max_value=0.80, value=0.55, step=0.01, key="bt_thresh")
-
-        st.markdown("---")
-        run_btn = st.button("Run Training", type="primary", key="bt_run")
-
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    fold_metrics_placeholder = st.empty()
-    results_placeholder = st.empty()
-
-    def on_progress(stage: str, p: float):
-        status_text.text(f"{stage} ... ({int(p*100)}%)")
-        progress_bar.progress(min(max(p, 0.0), 1.0))
-
-    def on_fold(fold: int, metrics: Dict[str, float]):
-        with fold_metrics_placeholder.container():
-            st.subheader(f"Fold {fold} metrics")
-            cols = st.columns(6)
-            cols[0].metric("AUC", f"{metrics['auc']:.3f}")
-            cols[1].metric("Accuracy", f"{metrics['accuracy']:.3f}")
-            cols[2].metric("Expectancy", f"{metrics['expectancy']:.3e}")
-            cols[3].metric("Sharpe", f"{metrics['sharpe']:.2f}")
-            cols[4].metric("Profit factor", f"{metrics['profit_factor']:.2f}")
-            cols[5].metric("Trades", f"{metrics['trades']}")
-
-    if run_btn:
-        try:
-            cost = CostModel(taker_fee_bps=taker_fee_bps, slippage_bps=slippage_bps)
-            results, summary, out_csv = run_pipeline(
-                symbol=symbol,
-                days=int(days),
-                cost=cost,
-                folds=int(folds),
-                val_days=int(val_days),
-                default_prob_threshold=float(prob_threshold),
-                progress_callback=on_progress,
-                fold_callback=on_fold,
-            )
-            progress_bar.progress(1.0)
-            status_text.success(f"Training complete. Results saved to {out_csv}")
-
-            with results_placeholder.container():
-                st.subheader("Performance Report")
-
-                # Cumulative PnL
-                cum = results["pnl"].cumsum()
-                fig = px.line(cum, title="Cumulative PnL (validation folds)", labels={"value": "PnL", "index": "Timestamp"})
-                st.plotly_chart(fig, use_container_width=True)
-
-                # Trades per minute
-                trades_per_day = (results["signal"] != 0).resample("1D").sum()
-                fig2 = px.bar(trades_per_day, title="Trades per day", labels={"value": "Trades", "index": "Day"})
-                st.plotly_chart(fig2, use_container_width=True)
-
-                # Summary table
-                st.subheader("Per-fold summary")
-                st.dataframe(summary.round(6), use_container_width=True)
-
-                # Download links
-                st.download_button(
-                    label="Download predictions.csv",
-                    data=open(out_csv, "rb").read(),
-                    file_name="predictions.csv",
-                    mime="text/csv",
-                )
-
-                # Show head of detailed results
-                st.subheader("Sample of per-minute results")
-                st.dataframe(results.head(200), use_container_width=True)
-
-        except Exception as e:
-            st.error(f"Error: {e}")
-    else:
-        # If predictions already exist, allow quick visualization without re-running
-        default_path = "data/processed/predictions.csv"
-        if os.path.exists(default_path):
-            try:
-                results = pd.read_csv(default_path, parse_dates=["timestamp"]).set_index("timestamp")
-                st.info("Found existing results at data/processed/predictions.csv")
-                cum = results["pnl"].cumsum()
-                fig = px.line(cum, title="Cumulative PnL (existing results)", labels={"value": "PnL", "index": "Timestamp"})
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception:
-                pass
-
-# ----------------------------- Realtime tab -----------------------------
-with tabs[1]:
     st.subheader("Realtime predictions with rich multi-timeframe features")
     colA, colB, colC = st.columns(3)
     rt_symbol = colA.text_input("Symbol", value="ETH/USDT", key="rt_symbol")
@@ -189,7 +96,10 @@ with tabs[1]:
             ph_status = st.empty()
             ph_metrics = st.empty()
             ph_table = st.empty()
+            ph_trades = st.empty()
             rows: List[Dict] = []
+            trade_rows: List[Dict] = []
+            pending_trade: Optional[Dict] = None
 
             for i in range(int(rt_minutes)):
                 # Fetch recent candles (limit 800) without 'since' to get the freshest bars
@@ -227,12 +137,24 @@ with tabs[1]:
                     confidence = 0.0
                 signal = int(1 if prob_up > threshold else (-1 if prob_up < 1 - threshold else 0))
 
-                # Track row; eligibility will be set after evaluation
+                # Track row and maybe open virtual trade
                 rows.append(dict(timestamp=ts, prob_up=prob_up, confidence=confidence, signal=signal))
                 df_rows = pd.DataFrame(rows)
                 ph_table.dataframe(df_rows.tail(50), use_container_width=True)
 
                 ph_status.info(f"[{i+1}/{int(rt_minutes)}] {ts} prob_up={prob_up:.4f} conf={confidence:.3f} signal={signal}")
+
+                eligible = (signal != 0) and (confidence >= min_conf)
+                entry_price = float(raw.loc[ts, "close"]) if ts in raw.index else np.nan
+                if eligible:
+                    side = "LONG" if signal == 1 else "SHORT"
+                    pending_trade = dict(
+                        entry_ts=ts,
+                        side=side,
+                        entry_price=entry_price,
+                        confidence=confidence,
+                        threshold=threshold,
+                    )
 
                 # Wait until next minute ends, then evaluate correctness
                 next_ts = (pd.Timestamp(ts).floor("T") + pd.Timedelta(minutes=1)).tz_convert("UTC")
@@ -250,7 +172,7 @@ with tabs[1]:
                     c0 = float(raw2.loc[ts, "close"])
                     c1 = float(raw2.loc[next_ts, "close"])
                     next_ret = float(np.log(c1) - np.log(c0))
-                    tau = cost.roundtrip_cost_ret
+                    tau = float(CostModel(taker_fee_bps=rt_fee, slippage_bps=rt_slip).roundtrip_cost_ret)
 
                     if signal == 1:
                         correct = bool(next_ret > tau)
@@ -262,13 +184,25 @@ with tabs[1]:
                         correct = bool(abs(next_ret) <= tau)
                         pnl = 0.0
 
-                    eligible = (signal != 0) and (confidence >= min_conf)
-
                     # Update last row with evaluation
                     rows[-1]["next_ret"] = next_ret
                     rows[-1]["correct"] = correct
                     rows[-1]["eligible"] = bool(eligible)
                     rows[-1]["pnl"] = pnl
+
+                    # If we opened a virtual trade, close and record it now
+                    if pending_trade is not None and bool(eligible):
+                        trade_rows.append(dict(
+                            entry_ts=str(pending_trade["entry_ts"]),
+                            side=pending_trade["side"],
+                            entry_price=float(pending_trade["entry_price"]),
+                            exit_ts=str(next_ts),
+                            exit_price=float(c1),
+                            confidence=float(pending_trade["confidence"]),
+                            result="WIN" if correct else "LOSS" if signal != 0 else "FLAT",
+                            pnl=float(pnl),
+                        ))
+                        pending_trade = None
 
                     # Build DataFrame and compute summary metrics
                     df_rows = pd.DataFrame(rows)
@@ -290,7 +224,10 @@ with tabs[1]:
                         mc3.metric("Cum PnL (eligible)", f"{cum_pnl:.3e}")
                         mc4.metric("All signals", f"{trades}")
 
-                    ph_table.dataframe(df_rows.tail(50), use_container_width=True)
+                    # Update trade log UI
+                    if trade_rows:
+                        df_tr = pd.DataFrame(trade_rows)
+                        ph_trades.dataframe(df_tr.tail(50), use_container_width=True)
 
             # Save preview to CSV
             os.makedirs("data/processed", exist_ok=True)
@@ -303,5 +240,191 @@ with tabs[1]:
                 file_name="realtime_preview.csv",
                 mime="text/csv",
             )
+            # Save trade log as well if any
+            if trade_rows:
+                out_trades = "data/processed/realtime_trades.csv"
+                pd.DataFrame(trade_rows).to_csv(out_trades, index=False)
+                st.download_button(
+                    "Download realtime_trades.csv",
+                    data=open(out_trades, "rb").read(),
+                    file_name="realtime_trades.csv",
+                    mime="text/csv",
+                )
         except Exception as e:
             st.error(f"Realtime preview error: {e}")
+
+# ----------------------------- Advanced Live tab -----------------------------
+with tabs[1]:
+    st.subheader("Live (advanced): multi-level signals with training progress")
+    colA, colB, colC = st.columns(3)
+    adv_symbol = colA.text_input("Symbol", value="ETH/USDT", key="adv_symbol")
+    adv_days = colB.number_input("Train lookback (days)", min_value=15, max_value=365, value=120, step=5, key="adv_days")
+    adv_minutes = colC.number_input("Preview minutes", min_value=1, max_value=240, value=10, step=1, key="adv_preview")
+
+    colD, colE, colF = st.columns(3)
+    adv_fee = colD.number_input("Taker fee per side (bps)", min_value=0.0, max_value=50.0, value=4.0, step=0.5, key="adv_fee")
+    adv_slip = colE.number_input("Slippage per side (bps)", min_value=0.0, max_value=50.0, value=1.0, step=0.5, key="adv_slip")
+    adv_min_conf = float(colF.slider("Min confidence to count a trade", min_value=0.00, max_value=1.00, value=0.40, step=0.01, key="adv_min_conf"))
+
+    train_adv_btn = st.button("Train/Refresh advanced model", key="adv_train")
+    run_adv_btn = st.button("Run advanced live preview", type="primary", key="adv_run")
+
+    adv_progress = st.progress(0.0)
+    adv_status = st.empty()
+
+    if train_adv_btn:
+        try:
+            cost = CostModel(taker_fee_bps=adv_fee, slippage_bps=adv_slip)
+            def on_prog(stage: str, p: float):
+                adv_status.text(f"{stage} ... ({int(p*100)}%)")
+                adv_progress.progress(min(max(p, 0.0), 1.0))
+            model_path, meta_path = train_multilevel_model(adv_symbol, int(adv_days), cost, progress=on_prog)
+            adv_progress.progress(1.0)
+            adv_status.success(f"Advanced model trained.\nModel: {model_path}\nMeta: {meta_path}")
+        except Exception as e:
+            st.error(f"Advanced training error: {e}")
+
+    if run_adv_btn:
+        try:
+            bundle = load_advanced_bundle()
+            if bundle is None:
+                st.warning("No advanced model found. Training one now...")
+                cost = CostModel(taker_fee_bps=adv_fee, slippage_bps=adv_slip)
+                def on_prog(stage: str, p: float):
+                    adv_status.text(f"{stage} ... ({int(p*100)}%)")
+                    adv_progress.progress(min(max(p, 0.0), 1.0))
+                train_multilevel_model(adv_symbol, int(adv_days), cost, progress=on_prog)
+                bundle = load_advanced_bundle()
+
+            assert bundle is not None
+            ph_status = st.empty()
+            ph_metrics = st.empty()
+            ph_table = st.empty()
+            ph_trades = st.empty()
+            rows: List[Dict] = []
+            trade_rows: List[Dict] = []
+            pending_trade: Optional[Dict] = None
+
+            for i in range(int(adv_minutes)):
+                ts, prob_up, signal, confidence = predict_latest(adv_symbol, feature_minutes=1200, bundle=bundle)
+                signal_str = {2: "LONG x2", 1: "LONG", 0: "FLAT", -1: "SHORT", -2: "SHORT x2"}[int(signal)]
+
+                rows.append(dict(timestamp=ts, prob_up=prob_up, confidence=confidence, signal=signal, signal_str=signal_str))
+                df_rows = pd.DataFrame(rows)
+                ph_table.dataframe(df_rows.tail(50), use_container_width=True)
+                ph_status.info(f"[{i+1}/{int(adv_minutes)}] {ts} prob_up={prob_up:.4f} conf={confidence:.3f} signal={signal_str}")
+
+                # Decide eligibility and potentially open a virtual position
+                eligible = (signal != 0) and (confidence >= adv_min_conf)
+                # Fetch immediate entry price from exchange for accuracy
+                import ccxt
+                ex = ccxt.binance({"enableRateLimit": True})
+                raw_rows = ex.fetch_ohlcv(adv_symbol, timeframe="1m", limit=5)
+                raw = pd.DataFrame(raw_rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                raw["timestamp"] = pd.to_datetime(raw["timestamp"], unit="ms", utc=True)
+                raw = raw.set_index("timestamp").sort_index().drop_duplicates()
+                entry_price = float(raw.loc[ts, "close"]) if ts in raw.index else np.nan
+                if eligible:
+                    side = "LONG" if signal > 0 else "SHORT"
+                    pending_trade = dict(
+                        entry_ts=ts,
+                        side=side,
+                        entry_price=entry_price,
+                        confidence=confidence,
+                    )
+
+                # Wait for next bar and evaluate correctness vs cost-aware threshold
+                next_ts = (pd.Timestamp(ts).floor("T") + pd.Timedelta(minutes=1)).tz_convert("UTC")
+                sleep_s = max(2.0, (next_ts - pd.Timestamp.now(tz="UTC")).total_seconds() + 2.0)
+                time.sleep(sleep_s)
+
+                # Evaluate
+                raw2_rows = ex.fetch_ohlcv(adv_symbol, timeframe="1m", limit=5)
+                raw2 = pd.DataFrame(raw2_rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                raw2["timestamp"] = pd.to_datetime(raw2["timestamp"], unit="ms", utc=True)
+                raw2 = raw2.set_index("timestamp").sort_index().drop_duplicates()
+                if (ts in raw2.index) and (next_ts in raw2.index):
+                    c0 = float(raw2.loc[ts, "close"])
+                    c1 = float(raw2.loc[next_ts, "close"])
+                    next_ret = float(np.log(c1) - np.log(c0))
+                    meta = bundle["meta"]
+                    tau = 2.0 * (float(meta["taker_fee_bps"]) + float(meta["slippage_bps"])) / 10000.0
+                    # For strength 2, require > 2*tau for correctness; for strength 1, > tau
+                    if signal > 0:
+                        req = (2 * tau) if signal == 2 else tau
+                        correct = bool(next_ret > req)
+                        pnl = float(next_ret - req)
+                    elif signal < 0:
+                        req = (2 * tau) if signal == -2 else tau
+                        correct = bool(next_ret < -req)
+                        pnl = float(-next_ret - req)
+                    else:
+                        correct = bool(abs(next_ret) <= tau)
+                        pnl = 0.0
+
+                    rows[-1]["next_ret"] = next_ret
+                    rows[-1]["correct"] = correct
+                    rows[-1]["eligible"] = bool(eligible)
+                    rows[-1]["pnl"] = pnl
+
+                    # Close pending trade if opened
+                    if pending_trade is not None and bool(eligible):
+                        trade_rows.append(dict(
+                            entry_ts=str(pending_trade["entry_ts"]),
+                            side=pending_trade["side"],
+                            entry_price=float(pending_trade["entry_price"]),
+                            exit_ts=str(next_ts),
+                            exit_price=float(c1),
+                            confidence=float(pending_trade["confidence"]),
+                            result="WIN" if correct else "LOSS" if signal != 0 else "FLAT",
+                            pnl=float(pnl),
+                        ))
+                        pending_trade = None
+
+                    # Build DataFrame and compute summary metrics
+                    df_rows = pd.DataFrame(rows)
+                    if "eligible" in df_rows.columns:
+                        df_elig = df_rows[df_rows["eligible"] == True]
+                    else:
+                        df_elig = pd.DataFrame(columns=df_rows.columns)
+
+                    trades = int((df_rows["signal"] != 0).sum())
+                    elig_trades = int(len(df_elig))
+                    wins = int(df_elig["correct"].sum()) if elig_trades > 0 else 0
+                    win_rate = (wins / elig_trades) if elig_trades > 0 else 0.0
+                    cum_pnl = float(df_elig["pnl"].sum()) if ("pnl" in df_elig.columns and elig_trades > 0) else 0.0
+
+                    with ph_metrics.container():
+                        mc1, mc2, mc3, mc4 = st.columns(4)
+                        mc1.metric("Eligible trades", f"{elig_trades}")
+                        mc2.metric("Win rate (eligible)", f"{win_rate * 100:.1f}%")
+                        mc3.metric("Cum PnL (eligible)", f"{cum_pnl:.3e}")
+                        mc4.metric("All signals", f"{trades}")
+
+                    # Update trade log UI
+                    if trade_rows:
+                        df_tr = pd.DataFrame(trade_rows)
+                        ph_trades.dataframe(df_tr.tail(50), use_container_width=True)
+
+            # Save preview to CSV
+            os.makedirs("data/processed", exist_ok=True)
+            out_csv = "data/processed/advanced_preview.csv"
+            pd.DataFrame(rows).to_csv(out_csv, index=False)
+            st.success(f"Advanced realtime preview saved: {out_csv}")
+            st.download_button(
+                "Download advanced_preview.csv",
+                data=open(out_csv, "rb").read(),
+                file_name="advanced_preview.csv",
+                mime="text/csv",
+            )
+            if trade_rows:
+                out_trades = "data/processed/advanced_trades.csv"
+                pd.DataFrame(trade_rows).to_csv(out_trades, index=False)
+                st.download_button(
+                    "Download advanced_trades.csv",
+                    data=open(out_trades, "rb").read(),
+                    file_name="advanced_trades.csv",
+                    mime="text/csv",
+                )
+        except Exception as e:
+            st.error(f"Advanced preview error: {e}")
