@@ -10,6 +10,21 @@ def run(cmd, check=True):
         raise SystemExit(result.returncode)
 
 
+def _in_colab() -> bool:
+    # Multiple heuristics to detect Google Colab
+    try:
+        import google.colab  # type: ignore
+        return True
+    except Exception:
+        pass
+    if os.environ.get("COLAB_RELEASE_TAG") or os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
+        return True
+    try:
+        return os.path.exists("/content") and os.getcwd().startswith("/content")
+    except Exception:
+        return False
+
+
 def main():
     # 1) Install requirements using the current interpreter
     req_file = "requirements.txt"
@@ -20,8 +35,17 @@ def main():
 
     args = set(sys.argv[1:])
 
-    # Default behavior: if no args, open Tkinter UI (Windows double-click friendly)
-    if not args or "--tk" in args or "tk" in args:
+    # Default behavior:
+    # - In desktop/servers: open Tkinter UI (Windows double-click friendly)
+    # - In Google Colab: open Streamlit UI with a public ngrok URL
+    if not args:
+        if _in_colab():
+            args.add("--colab")
+        else:
+            args.add("--tk")
+
+    # Tkinter UI
+    if "--tk" in args or "tk" in args:
         tk_script = os.path.join("src", "tk_app.py")
         if not os.path.exists(tk_script):
             print(f"{tk_script} not found.")
@@ -29,7 +53,7 @@ def main():
         run(f'"{sys.executable}" "{tk_script}"')
         return
 
-    # If user requested the Streamlit UI, launch it
+    # Streamlit UI (local)
     if "--ui" in args or "ui" in args or "--streamlit" in args:
         ui_script = os.path.join("src", "ui_app.py")
         if not os.path.exists(ui_script):
@@ -37,7 +61,11 @@ def main():
             raise SystemExit(1)
         # Allow overriding port via env var UI_PORT
         port = os.environ.get("UI_PORT", "8501")
-        run(f'"{sys.executable}" -m streamlit run "{ui_script}" --server.port {port}')
+        # Bind to all interfaces to support containers/VMs and remote port forwarding
+        run(
+            f'"{sys.executable}" -m streamlit run "{ui_script}" '
+            f'--server.port {port} --server.address 0.0.0.0 --server.headless true'
+        )
         return
 
     # Colab-friendly web launcher (Streamlit + ngrok)

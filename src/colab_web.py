@@ -40,6 +40,7 @@ def main():
     streamlit_cmd = [
         sys.executable, "-m", "streamlit", "run", ui_script,
         "--server.port", str(port),
+        "--server.address", "0.0.0.0",
         "--server.headless", "true",
         "--browser.gatherUsageStats", "false",
     ]
