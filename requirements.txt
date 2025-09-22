@@ -7,3 +7,7 @@ pyarrow>=14.0.0
 tqdm>=4.66.0
 streamlit>=1.36.0
 plotly>=5.24.0
+yfinance>=0.2.40
+google-generativeai>=0.7.2
+requests>=2.32.3
+optuna>=3.6.0

@@ -9,7 +9,7 @@ import pandas as pd
 import ccxt
 import lightgbm as lgb
 
-from src.features_ta import build_rich_features
+from src.feature_lib import build_enriched_features  # enriched TA + macro + (optional) on-chain
 from src.run_pipeline import CostModel, tune_threshold_for_pnl
 
 
@@ -235,8 +235,8 @@ def train_multilevel_model(
 ) -> Tuple[str, str]:
     """
     Train a multi-level (5-class) LightGBM model and save to data/processed/.
-    Includes a small random search over hyperparameters to maximize validation PnL.
-    Optionally keeps the last `backtest_days` out-of-sample for a small backtest.
+    Uses Optuna Bayesian HPO with time-series cross-validation to maximize mean PnL.
+    Falls back to a small random search if Optuna is unavailable.
     Returns (model_path, meta_path).
     """
     def report(stage: str, p: float):
@@ -249,7 +249,7 @@ def train_multilevel_model(
     raw_path = f"data/raw/{symbol.replace('/', '')}_1m_adv.parquet"
     df.to_parquet(raw_path)
     report("Building features", 0.10)
-    feats = build_rich_features(df)
+    feats = build_enriched_features(df, symbol)
 
     report("Labeling (multi-level)", 0.18)
     labeled = build_multi_level_labels(feats, cost)
@@ -270,103 +270,217 @@ def train_multilevel_model(
     else:
         back_mask = pd.Series(False, index=labeled.index)
 
-    # Train/validation split (on the non-backtest subset): last 15% for threshold tuning
-    idx_train_val = labeled.index[~back_mask]
+    # Non-backtest indices for HPO + final fit
+    idx_train_val = labeled.index[~back_mask].sort_values()
     n_tv = len(idx_train_val)
     if n_tv < 2000:
         raise RuntimeError("Not enough samples after excluding backtest for training/validation.")
 
-    split = int(n_tv * 0.85)
-    tv_idx_sorted = idx_train_val.sort_values()
-    idx_tr = tv_idx_sorted[:split]
-    idx_va = tv_idx_sorted[split:]
-
-    X_tr, y_tr = X_all.loc[idx_tr], y_all.loc[idx_tr]
-    X_va, y_va = X_all.loc[idx_va], y_all.loc[idx_va]
-    next_ret_va = labeled.loc[idx_va, "next_ret"]
+    # Time-series CV windows (3 folds default, 10% validation each)
+    n_folds = 3
+    vlen = max(500, int(n_tv * 0.10))
+    folds = []
+    for i in range(n_folds):
+        va_end = n_tv - i * vlen
+        va_start = max(0, va_end - vlen)
+        if va_start <= 0:
+            break
+        idx_va = idx_train_val[va_start:va_end]
+        idx_tr = idx_train_val[:va_start]
+        if len(idx_tr) < 1500 or len(idx_va) < 400:
+            continue
+        folds.append((idx_tr, idx_va))
+    folds = list(reversed(folds))  # older->newer
 
     classes = [-2, -1, 0, 1, 2]
     class_to_idx = {c: i for i, c in enumerate(classes)}
-    y_tr_idx = y_tr.map(class_to_idx)
-    y_va_idx = y_va.map(class_to_idx)
 
-    # Class weights to handle imbalance
-    cw = _class_weights(y_tr, classes)
+    # Class weights from the latest train split (or all) for stability
+    cw = _class_weights(y_all.loc[idx_train_val], classes)
     class_weight_list = [cw[c] for c in classes]
 
     import lightgbm as lgb
-    dtrain = lgb.Dataset(X_tr, label=y_tr_idx)
-    dval = lgb.Dataset(X_va, label=y_va_idx)
 
-    # Random search over params to maximize validation mean PnL
-    report("Hyperparameter search", 0.22)
-    rng = np.random.RandomState(42)
+    # Custom PnL evaluation metric (higher is better) - uses fold's validation segment
+    def make_pnl_feval(X_va_idx: pd.Index, next_ret_series: pd.Series):
+        X_va_idx = pd.Index(X_va_idx)
+        next_ret = next_ret_series.loc[X_va_idx]
+        def pnl_feval(y_pred: np.ndarray, dset: "lgb.Dataset"):
+            n = dset.num_data()
+            proba = y_pred.reshape(n, 5)
+            p_down2 = proba[:, class_to_idx[-2]]
+            p_down1 = proba[:, class_to_idx[-1]]
+            p_up1 = proba[:, class_to_idx[1]]
+            p_up2 = proba[:, class_to_idx[2]]
+            p_up_raw = p_up1 + p_up2
+            p_down_raw = p_down1 + p_down2
+            p_nonflat = p_up_raw + p_down_raw
+            with np.errstate(divide="ignore", invalid="ignore"):
+                p_up_cond = np.where(p_nonflat > 1e-12, p_up_raw / p_nonflat, 0.5)
+            # quick sweep
+            thresholds = np.linspace(0.6, 0.75, 11)
+            rt_cost = cost.roundtrip_cost_ret
+            best = -1e9
+            nr = next_ret.values[:n]
+            for t in thresholds:
+                sig = np.where(p_up_cond >= t, 1, np.where(p_up_cond <= 1 - t, -1, 0))
+                pnl = np.where(sig == 1, nr - rt_cost, np.where(sig == -1, -nr - rt_cost, 0.0))
+                m = float(np.mean(pnl))
+                if m > best:
+                    best = m
+            return ("val_mean_pnl", best, True)
+        return pnl_feval
+
+    # Try Optuna, else fallback to random search
+    best_params = None
+    best_score = -1e18
     best_model = None
-    best_thr = 0.55
-    best_mean_pnl = -1e9
+    best_thr = 0.65
 
-    trials = int(max(1, trials))
-    for i in range(trials):
-        params = _sample_params(rng, class_weight_list)
-        model = lgb.train(
+    report("Hyperparameter search", 0.22)
+    try:
+        import optuna  # type: ignore
+
+        def objective(trial: "optuna.Trial") -> float:
+            params = dict(
+                objective="multiclass",
+                num_class=5,
+                metric=["multi_logloss"],
+                boosting_type="gbdt",
+                num_leaves=trial.suggest_int("num_leaves", 64, 256),
+                learning_rate=trial.suggest_float("learning_rate", 0.01, 0.08, log=True),
+                feature_fraction=trial.suggest_float("feature_fraction", 0.6, 0.95),
+                bagging_fraction=trial.suggest_float("bagging_fraction", 0.6, 0.95),
+                bagging_freq=trial.suggest_int("bagging_freq", 1, 6),
+                min_data_in_leaf=trial.suggest_int("min_data_in_leaf", 50, 400),
+                max_depth=trial.suggest_categorical("max_depth", [-1, 8, 10, 12]),
+                lambda_l1=trial.suggest_float("lambda_l1", 1e-3, 10.0, log=True),
+                lambda_l2=trial.suggest_float("lambda_l2", 1e-3, 10.0, log=True),
+                min_gain_to_split=trial.suggest_float("min_gain_to_split", 1e-3, 5.0, log=True),
+                verbose=-1,
+                seed=trial.suggest_int("seed", 1, 10000),
+                class_weight=class_weight_list,
+                subsample=trial.suggest_float("subsample", 0.6, 0.95),
+                feature_pre_filter=False,
+            )
+            fold_scores = []
+            for (idx_tr, idx_va) in folds:
+                X_tr, y_tr = X_all.loc[idx_tr], y_all.loc[idx_tr].map(class_to_idx)
+                X_va, y_va = X_all.loc[idx_va], y_all.loc[idx_va].map(class_to_idx)
+                dtrain = lgb.Dataset(X_tr, label=y_tr)
+                dval = lgb.Dataset(X_va, label=y_va)
+                model = lgb.train(
+                    params,
+                    dtrain,
+                    num_boost_round=3000,
+                    valid_sets=[dtrain, dval],
+                    valid_names=["train", "valid"],
+                    feval=make_pnl_feval(idx_va, labeled["next_ret"]),
+                    callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)],
+                )
+                # Evaluate mean pnl on this fold using the live eval function
+                thr, mean_pnl = _eval_model_pnl(model, X_va, labeled.loc[idx_va, "next_ret"], class_to_idx, cost, min_confidence=0.20)
+                fold_scores.append(mean_pnl)
+            return -float(np.mean(fold_scores))  # minimize
+
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=int(max(5, trials)))
+        best_params = study.best_trial.params
+
+        # Train a final model on 85/15 split (kept for threshold tuning) using best params
+        split = int(n_tv * 0.85)
+        tv_idx_sorted = idx_train_val
+        idx_tr_final = tv_idx_sorted[:split]
+        idx_va_final = tv_idx_sorted[split:]
+        X_tr, y_tr = X_all.loc[idx_tr_final], y_all.loc[idx_tr_final].map(class_to_idx)
+        X_va, y_va = X_all.loc[idx_va_final], y_all.loc[idx_va_final].map(class_to_idx)
+        dtrain = lgb.Dataset(X_tr, label=y_tr)
+        dval = lgb.Dataset(X_va, label=y_va)
+        params = dict(best_params)
+        params.update(dict(objective="multiclass", num_class=5, metric=["multi_logloss"], verbose=-1, class_weight=class_weight_list))
+        best_model = lgb.train(
             params,
             dtrain,
             num_boost_round=4000,
             valid_sets=[dtrain, dval],
             valid_names=["train", "valid"],
-            callbacks=[
-                lgb.early_stopping(stopping_rounds=200, verbose=False),
-            ],
-        )
-        thr, mean_pnl = _eval_model_pnl(model, X_va, next_ret_va, class_to_idx, cost, min_confidence=0.20)
-        if mean_pnl > best_mean_pnl:
-            best_mean_pnl = mean_pnl
-            best_model = model
-            best_thr = thr
-        if progress:
-            progress(f"Hyperparameter search ({i+1}/{trials})", 0.22 + 0.5 * (i + 1) / trials)
-
-    if best_model is None:
-        # Fallback default
-        params = dict(
-            objective="multiclass",
-            num_class=5,
-            metric=["multi_logloss"],
-            boosting_type="gbdt",
-            num_leaves=128,
-            learning_rate=0.03,
-            feature_fraction=0.85,
-            bagging_fraction=0.8,
-            bagging_freq=1,
-            min_data_in_leaf=200,
-            verbose=-1,
-            seed=42,
-            class_weight=class_weight_list,
-        )
-        best_model = lgb.train(
-            params,
-            dtrain,
-            num_boost_round=3000,
-            valid_sets=[dtrain, dval],
-            valid_names=["train", "valid"],
+            feval=make_pnl_feval(idx_va_final, labeled["next_ret"]),
             callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)],
         )
-        best_thr, best_mean_pnl = _eval_model_pnl(best_model, X_va, next_ret_va, class_to_idx, cost, min_confidence=0.20)
+        best_thr, best_score = _eval_model_pnl(best_model, X_va, labeled.loc[idx_va_final, "next_ret"], class_to_idx, cost, min_confidence=0.20)
+    except Exception:
+        # Fallback to previous small random search on the 85/15 split
+        split = int(n_tv * 0.85)
+        tv_idx_sorted = idx_train_val
+        idx_tr = tv_idx_sorted[:split]
+        idx_va = tv_idx_sorted[split:]
+        X_tr, y_tr = X_all.loc[idx_tr], y_all.loc[idx_tr]
+        X_va, y_va = X_all.loc[idx_va], y_all.loc[idx_va]
+        next_ret_va = labeled.loc[idx_va, "next_ret"]
+        y_tr_idx = y_tr.map(class_to_idx)
+        y_va_idx = y_va.map(class_to_idx)
 
+        dtrain = lgb.Dataset(X_tr, label=y_tr_idx)
+        dval = lgb.Dataset(X_va, label=y_va_idx)
+
+        def pnl_feval(y_pred: np.ndarray, dset: "lgb.Dataset"):
+            n = dset.num_data()
+            proba = y_pred.reshape(n, 5)
+            p_down2 = proba[:, class_to_idx[-2]]
+            p_down1 = proba[:, class_to_idx[-1]]
+            p_up1 = proba[:, class_to_idx[1]]
+            p_up2 = proba[:, class_to_idx[2]]
+            p_up_raw = p_up1 + p_up2
+            p_down_raw = p_down1 + p_down2
+            p_nonflat = p_up_raw + p_down_raw
+            with np.errstate(divide="ignore", invalid="ignore"):
+                p_up_cond = np.where(p_nonflat > 1e-12, p_up_raw / p_nonflat, 0.5)
+            p_up_s = pd.Series(p_up_cond, index=X_va.index[:n])
+            thresholds = np.linspace(0.6, 0.75, 11)
+            rt_cost = cost.roundtrip_cost_ret
+            best = -1e9
+            for t in thresholds:
+                sig = np.where(p_up_s >= t, 1, np.where(p_up_s <= 1 - t, -1, 0))
+                pnl = np.where(sig == 1, next_ret_va.values[:n] - rt_cost,
+                               np.where(sig == -1, -next_ret_va.values[:n] - rt_cost, 0.0))
+                m = float(np.mean(pnl))
+                if m > best:
+                    best = m
+            return ("val_mean_pnl", best, True)
+
+        rng = np.random.RandomState(42)
+        best_mean_pnl = -1e9
+        trials_ = int(max(1, trials))
+        for i in range(trials_):
+            params = _sample_params(rng, class_weight_list)
+            model = lgb.train(
+                params,
+                dtrain,
+                num_boost_round=4000,
+                valid_sets=[dtrain, dval],
+                valid_names=["train", "valid"],
+                feval=pnl_feval,
+                callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)],
+            )
+            thr, mean_pnl = _eval_model_pnl(model, X_va, next_ret_va, class_to_idx, cost, min_confidence=0.20)
+            if mean_pnl > best_mean_pnl:
+                best_mean_pnl = mean_pnl
+                best_model = model
+                best_thr = thr
+            if progress:
+                progress(f"Hyperparameter search ({i+1}/{trials_})", 0.22 + 0.5 * (i + 1) / trials_)
 
     # Optional small backtest on held-out last `backtest_days`
     backtest_metrics: Dict[str, float] = {}
-    if back_mask.any():
+    if back_mask.any() and best_model is not None:
         report("Backtesting (holdout)", 0.75)
         idx_bt = labeled.index[back_mask]
         X_bt = X_all.loc[idx_bt]
         next_ret_bt = labeled.loc[idx_bt, "next_ret"]
         proba_bt = best_model.predict(X_bt, num_iteration=getattr(best_model, "best_iteration", None))
 
-        # Compute CONDITIONAL p_up for backtest to match live logic
         p_down2_bt = proba_bt[:, class_to_idx[-2]]
         p_down1_bt = proba_bt[:, class_to_idx[-1]]
-        p_flat_bt  = proba_bt[:, class_to_idx[0]]
         p_up1_bt   = proba_bt[:, class_to_idx[1]]
         p_up2_bt   = proba_bt[:, class_to_idx[2]]
 
@@ -381,10 +495,7 @@ def train_multilevel_model(
         rt_cost = cost.roundtrip_cost_ret
         signal_bt = np.where(p_up_bt_s > t, 1, np.where(p_up_bt_s < 1 - t, -1, 0))
         pnl_bt = np.where(signal_bt == 1, next_ret_bt - rt_cost, np.where(signal_bt == -1, -next_ret_bt - rt_cost, 0.0))
-        df_bt = pd.DataFrame(
-            {"prob_up": p_up_bt_s, "signal": signal_bt, "next_ret": next_ret_bt, "pnl": pnl_bt},
-            index=idx_bt,
-        )
+        df_bt = pd.DataFrame({"prob_up": p_up_bt_s, "signal": signal_bt, "next_ret": next_ret_bt, "pnl": pnl_bt}, index=idx_bt)
         os.makedirs("data/processed", exist_ok=True)
         df_bt.to_csv("data/processed/advanced_backtest.csv", index_label="timestamp")
 
@@ -393,17 +504,14 @@ def train_multilevel_model(
         win_rate = float(wins / trades) if trades > 0 else 0.0
         cum_pnl = float(df_bt["pnl"].sum())
         expectancy = float(df_bt["pnl"].mean())
-        backtest_metrics = dict(
-            trades=trades,
-            win_rate=win_rate,
-            cum_pnl=cum_pnl,
-            expectancy=expectancy,
-            days=int(backtest_days),
-        )
+        backtest_metrics = dict(trades=trades, win_rate=win_rate, cum_pnl=cum_pnl, expectancy=expectancy, days=int(backtest_days))
 
     report("Finalizing model", 0.80)
 
     # Save model and metadata
+    if best_model is None:
+        raise RuntimeError("Model training failed to produce a valid model.")
+
     model_path = "data/processed/advanced_model.txt"
     meta_path = "data/processed/advanced_meta.json"
     best_model.save_model(model_path)
@@ -416,7 +524,6 @@ def train_multilevel_model(
         best_iteration=getattr(best_model, "best_iteration", None),
         classes=classes,
     ).__dict__
-    # Add extras
     meta["trials"] = int(trials)
     if back_mask.any():
         meta["backtest_days"] = int(backtest_days)
@@ -445,10 +552,14 @@ def predict_latest(
     feature_minutes: int,
     bundle: Dict,
     threshold_override: Optional[float] = None,
+    extra_features: Optional[Dict[str, float]] = None,
 ) -> Tuple[pd.Timestamp, float, int, float]:
     """
     Predict on the latest completed minute using the advanced model.
     Returns (timestamp, prob_up, signal_strength in {-2..2}, confidence)
+
+    extra_features: optional dict of additional feature_name -> value (e.g., sentiment_manual)
+                    Only applied if the feature exists in the trained model's feature list.
     """
     booster: lgb.Booster = bundle["booster"]
     meta = bundle["meta"]
@@ -468,11 +579,19 @@ def predict_latest(
     raw["timestamp"] = pd.to_datetime(raw["timestamp"], unit="ms", utc=True)
     raw = raw.set_index("timestamp").sort_index().drop_duplicates()
 
-    feats = build_rich_features(raw)
+    # Build enriched features (includes macro/on-chain when available)
+    feats = build_enriched_features(raw, symbol)
     if feats.empty:
         raise RuntimeError("Insufficient features for prediction.")
     ts = feats.index[-1]
     X_row = feats.iloc[[-1]].copy()
+
+    # Inject any provided extra features if the model expects them
+    if extra_features:
+        for k, v in extra_features.items():
+            if k in feature_names:
+                X_row[k] = float(v)
+
     # Align columns
     for col in feature_names:
         if col not in X_row.columns:
