@@ -248,7 +248,7 @@ class LiveApp(tk.Tk):
             import ccxt
             ex = ccxt.binance({"enableRateLimit": True})
             ts_utc = pd.Timestamp(ts_utc).tz_convert("UTC")
-            next_ts = (ts_utc.floor("T") + pd.Timedelta(minutes=1)).tz_convert("UTC")
+            next_ts = (ts_utc.floor("min") + pd.Timedelta(minutes=1)).tz_convert("UTC")
 
             # 1) Try anchored fetch around the target minute
             since_ms = int((ts_utc - pd.Timedelta(minutes=2)).timestamp() * 1000)
@@ -810,7 +810,7 @@ class LiveApp(tk.Tk):
                 })
 
                 # Evaluate after next bar closes
-                next_ts = (pd.Timestamp(ts).floor("T") + pd.Timedelta(minutes=1)).tz_convert("UTC")
+                next_ts = (pd.Timestamp(ts).floor("min") + pd.Timedelta(minutes=1)).tz_convert("UTC")
                 sleep_s = max(2.0, (next_ts - pd.Timestamp.now(tz="UTC")).total_seconds() + 2.0)
                 # Allow responsive stopping during sleep
                 end_time = time.time() + sleep_s
