@@ -314,7 +314,8 @@ def train_multilevel_model(
             elif n == len_va:
                 nr = next_ret_va
             else:
-                return ("val_mean_pnl", -1e9, True)  # Should not happen
+                # This case should not be hit if used correctly with dtrain/dval
+                return ("val_mean_pnl", -1e9, True)
 
             proba = y_pred.reshape(n, 5)
             p_down2 = proba[:, class_to_idx[-2]]
@@ -452,11 +453,16 @@ def train_multilevel_model(
             with np.errstate(divide="ignore", invalid="ignore"):
                 p_up_cond = np.where(p_nonflat > 1e-12, p_up_raw / p_nonflat, 0.5)
 
+            # This Series creation is not strictly necessary for the logic but was in the original
+            # except block. To minimize changes, we'll keep a similar structure, but ensure it
+            # doesn't cause an error by using a generic range index. The `p_up_cond` array is all
+            # that's used in the calculation.
+            p_up_s = pd.Series(p_up_cond)
             thresholds = np.linspace(0.6, 0.75, 11)
             rt_cost = cost.roundtrip_cost_ret
             best = -1e9
             for t in thresholds:
-                sig = np.where(p_up_cond >= t, 1, np.where(p_up_cond <= 1 - t, -1, 0))
+                sig = np.where(p_up_s >= t, 1, np.where(p_up_s <= 1 - t, -1, 0))
                 pnl = np.where(sig == 1, nr - rt_cost,
                                np.where(sig == -1, -nr - rt_cost, 0.0))
                 m = float(np.mean(pnl))
