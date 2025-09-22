@@ -12,6 +12,7 @@ try:
     from src.run_pipeline import CostModel  # type: ignore
     from src.realtime_pipeline import train_model as train_realtime_model  # type: ignore
     from src.advanced_trainer import train_multilevel_model, load_advanced_bundle, predict_latest  # type: ignore
+    from src.ensemble_trainer import train_ensemble_stacked, load_ensemble_bundle, predict_latest_ensemble  # type: ignore
 except Exception:
     import sys
     from pathlib import Path
@@ -21,6 +22,7 @@ except Exception:
     from src.run_pipeline import CostModel  # type: ignore
     from src.realtime_pipeline import train_model as train_realtime_model  # type: ignore
     from src.advanced_trainer import train_multilevel_model, load_advanced_bundle, predict_latest  # type: ignore
+    from src.ensemble_trainer import train_ensemble_stacked, load_ensemble_bundle, predict_latest_ensemble  # type: ignore
 
 from src.features_ta import build_rich_features  # type: ignore
 import lightgbm as lgb  # type: ignore
@@ -294,7 +296,9 @@ with tabs[1]:
     adv_slip = colE.number_input("Slippage per side (bps)", min_value=0.0, max_value=50.0, value=1.0, step=0.5, key="adv_slip")
     adv_min_conf = float(colF.slider("Min confidence to count a trade", min_value=0.00, max_value=1.00, value=0.40, step=0.01, key="adv_min_conf"))
 
-    train_adv_btn = st.button("Train/Refresh advanced model", key="adv_train")
+    colG, colH = st.columns(2)
+    use_ensemble = bool(colG.checkbox("Use ensemble (stacked: LGBM + RF + MLP)", value=False, key="adv_use_ens"))
+    train_adv_btn = colH.button("Train/Refresh advanced model", key="adv_train")
     run_adv_btn = st.button("Run advanced live preview", type="primary", key="adv_run")
 
     adv_progress = st.progress(0.0)
@@ -306,7 +310,10 @@ with tabs[1]:
             def on_prog(stage: str, p: float):
                 adv_status.text(f"{stage} ... ({int(p*100)}%)")
                 adv_progress.progress(min(max(p, 0.0), 1.0))
-            model_path, meta_path = train_multilevel_model(adv_symbol, int(adv_days), cost, progress=on_prog)
+            if use_ensemble:
+                model_path, meta_path = train_ensemble_stacked(adv_symbol, int(adv_days), cost, progress=on_prog)
+            else:
+                model_path, meta_path = train_multilevel_model(adv_symbol, int(adv_days), cost, progress=on_prog)
             adv_progress.progress(1.0)
             adv_status.success(f"Advanced model trained.\nModel: {model_path}\nMeta: {meta_path}")
         except Exception as e:
@@ -314,15 +321,27 @@ with tabs[1]:
 
     if run_adv_btn:
         try:
-            bundle = load_advanced_bundle()
-            if bundle is None:
-                st.warning("No advanced model found. Training one now...")
-                cost = CostModel(taker_fee_bps=adv_fee, slippage_bps=adv_slip)
-                def on_prog(stage: str, p: float):
-                    adv_status.text(f"{stage} ... ({int(p*100)}%)")
-                    adv_progress.progress(min(max(p, 0.0), 1.0))
-                train_multilevel_model(adv_symbol, int(adv_days), cost, progress=on_prog)
+            # Load appropriate bundle (ensemble or single advanced)
+            if use_ensemble:
+                bundle = load_ensemble_bundle()
+                if bundle is None:
+                    st.warning("No ensemble model found. Training one now...")
+                    cost = CostModel(taker_fee_bps=adv_fee, slippage_bps=adv_slip)
+                    def on_prog(stage: str, p: float):
+                        adv_status.text(f"{stage} ... ({int(p*100)}%)")
+                        adv_progress.progress(min(max(p, 0.0), 1.0))
+                    train_ensemble_stacked(adv_symbol, int(adv_days), cost, progress=on_prog)
+                    bundle = load_ensemble_bundle()
+            else:
                 bundle = load_advanced_bundle()
+                if bundle is None:
+                    st.warning("No advanced model found. Training one now...")
+                    cost = CostModel(taker_fee_bps=adv_fee, slippage_bps=adv_slip)
+                    def on_prog(stage: str, p: float):
+                        adv_status.text(f"{stage} ... ({int(p*100)}%)")
+                        adv_progress.progress(min(max(p, 0.0), 1.0))
+                    train_multilevel_model(adv_symbol, int(adv_days), cost, progress=on_prog)
+                    bundle = load_advanced_bundle()
 
             assert bundle is not None
             ph_status = st.empty()
@@ -338,8 +357,13 @@ with tabs[1]:
                 extra = {}
                 if "sentiment_score" in st.session_state:
                     extra["sentiment_manual"] = float(st.session_state["sentiment_score"])
-                ts, prob_up, signal, confidence = predict_latest(adv_symbol, feature_minutes=1800, bundle=bundle, extra_features=extra)
-                signal_str = {2: "LONG x2", 1: "LONG", 0: "FLAT", -1: "SHORT", -2: "SHORT x2"}[int(signal)]
+
+                if use_ensemble:
+                    ts, prob_up, signal, confidence = predict_latest_ensemble(adv_symbol, feature_minutes=1800, bundle=bundle, extra_features=extra)
+                    signal_str = {1: "LONG", 0: "FLAT", -1: "SHORT"}[int(signal)]
+                else:
+                    ts, prob_up, signal, confidence = predict_latest(adv_symbol, feature_minutes=1800, bundle=bundle, extra_features=extra)
+                    signal_str = {2: "LONG x2", 1: "LONG", 0: "FLAT", -1: "SHORT", -2: "SHORT x2"}[int(signal)]
 
                 rows.append(dict(timestamp=ts, prob_up=prob_up, confidence=confidence, signal=signal, signal_str=signal_str, sentiment=extra.get("sentiment_manual", 0.0)))
                 df_rows = pd.DataFrame(rows)
@@ -381,13 +405,13 @@ with tabs[1]:
                     next_ret = float(np.log(c1) - np.log(c0))
                     meta = bundle["meta"]
                     tau = 2.0 * (float(meta["taker_fee_bps"]) + float(meta["slippage_bps"])) / 10000.0
-                    # For strength 2, require > 2*tau for correctness; for strength 1, > tau
+                    # For ensemble (no strength), require > tau; for advanced strength=2, require 2*tau
                     if signal > 0:
-                        req = (2 * tau) if signal == 2 else tau
+                        req = tau if (use_ensemble or signal == 1) else (2 * tau)
                         correct = bool(next_ret > req)
                         pnl = float(next_ret - req)
                     elif signal < 0:
-                        req = (2 * tau) if signal == -2 else tau
+                        req = tau if (use_ensemble or signal == -1) else (2 * tau)
                         correct = bool(next_ret < -req)
                         pnl = float(-next_ret - req)
                     else:

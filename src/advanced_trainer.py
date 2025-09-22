@@ -298,6 +298,35 @@ def train_multilevel_model(
     dtrain = lgb.Dataset(X_tr, label=y_tr_idx)
     dval = lgb.Dataset(X_va, label=y_va_idx)
 
+    # Custom PnL evaluation metric (higher is better)
+    def pnl_feval(y_pred: np.ndarray, dset: "lgb.Dataset"):
+        # y_pred is flat array of length n * num_class
+        n = dset.num_data()
+        proba = y_pred.reshape(n, 5)
+        # Compute conditional p_up on validation order
+        p_down2 = proba[:, class_to_idx[-2]]
+        p_down1 = proba[:, class_to_idx[-1]]
+        p_up1 = proba[:, class_to_idx[1]]
+        p_up2 = proba[:, class_to_idx[2]]
+        p_up_raw = p_up1 + p_up2
+        p_down_raw = p_down1 + p_down2
+        p_nonflat = p_up_raw + p_down_raw
+        with np.errstate(divide="ignore", invalid="ignore"):
+            p_up_cond = np.where(p_nonflat > 1e-12, p_up_raw / p_nonflat, 0.5)
+        p_up_s = pd.Series(p_up_cond, index=X_va.index[:n])
+        # quick sweep
+        thresholds = np.linspace(0.6, 0.75, 11)
+        rt_cost = cost.roundtrip_cost_ret
+        best = -1e9
+        for t in thresholds:
+            sig = np.where(p_up_s >= t, 1, np.where(p_up_s <= 1 - t, -1, 0))
+            pnl = np.where(sig == 1, next_ret_va.values[:n] - rt_cost,
+                           np.where(sig == -1, -next_ret_va.values[:n] - rt_cost, 0.0))
+            m = float(np.mean(pnl))
+            if m > best:
+                best = m
+        return ("val_mean_pnl", best, True)
+
     # Random search over params to maximize validation mean PnL
     report("Hyperparameter search", 0.22)
     rng = np.random.RandomState(42)
@@ -314,6 +343,7 @@ def train_multilevel_model(
             num_boost_round=4000,
             valid_sets=[dtrain, dval],
             valid_names=["train", "valid"],
+            feval=pnl_feval,
             callbacks=[
                 lgb.early_stopping(stopping_rounds=200, verbose=False),
             ],
@@ -349,6 +379,7 @@ def train_multilevel_model(
             num_boost_round=3000,
             valid_sets=[dtrain, dval],
             valid_names=["train", "valid"],
+            feval=pnl_feval,
             callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)],
         )
         best_thr, best_mean_pnl = _eval_model_pnl(best_model, X_va, next_ret_va, class_to_idx, cost, min_confidence=0.20)
