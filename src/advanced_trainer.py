@@ -278,7 +278,9 @@ def train_multilevel_model(
     # More aggressive default parallelism: use most of the CPUs, cap at 16 by default
     if n_jobs is None or int(n_jobs) <= 0:
         n_jobs = max(1, min(16, cpu_count - 1 if cpu_count >= 3 else cpu_count))
-    # Each LightGBM training uses its own threads. Reserve threads per trial to avoid oversubu_count // int(max(1, n_jobs)))
+    # Each LightGBM training uses its own threads. Reserve threads per trial to avoid oversubscription.
+    lgb_threads = max(2, cpu_count // int(max(1, n_jobs)))
+    _LGB_THREADS = int(lgb_threads)
 
     report("Labeling (multi-level)", 0.18)
     labeled = build_multi_level_labels(feats, cost)
@@ -401,7 +403,7 @@ def train_multilevel_model(
                 class_weight=class_weight_list,
                 subsample=trial.suggest_float("subsample", 0.6, 0.95),
                 feature_pre_filter=False,
-                num_threads=int(lgb_threads),
+                num_threads=_LGB_THREADS,
             )
             fold_scores = []
             for (idx_tr, idx_va) in folds:
@@ -429,9 +431,9 @@ def train_multilevel_model(
         study.optimize(objective, n_trials=int(max(5, trials)), n_jobs=int(max(1, n_jobs)))
         best_params = study.best_trial.params
         # Ensure final params carry our thread setting
-        best_params["num_threads"] = int(lgb_threads)
+        best_params["num_threads"] = _LGB_THREADS
         # Report chosen parallelism
-        report(f"Optuna parallel trials: {int(max(1, n_jobs))}, LGBM threads/trial: {int(lgb_threads)}", 0.72)
+        report(f"Optuna parallel trials: {int(max(1, n_jobs))}, LGBM threads/trial: {_LGB_THREADS}", 0.72)
 
         # Train a final model on 85/15 split (kept for threshold tuning) using best params
         split = int(n_tv * 0.85)
@@ -445,7 +447,7 @@ def train_multilevel_model(
         params = dict(best_params)
         params.update(dict(objective="multiclass", num_class=5, metric=["multi_logloss"], verbose=-1, class_weight=class_weight_list))
         # Ensure thread setting is present
-        params["num_threads"] = int(lgb_threads)
+        params["num_threads"] = _LGB_THREADS
         best_model = lgb.train(
             params,
             dtrain,
@@ -517,7 +519,7 @@ def train_multilevel_model(
         # Parallel random search using threads; cap LightGBM threads per trial
         def run_one(_seed: int) -> Tuple[float, float, "lgb.Booster"]:
             local_params = _sample_params(np.random.RandomState(_seed), class_weight_list)
-            local_params["num_threads"] = int(lgb_threads)
+            local_params["num_threads"] = _LGB_THREADS
             mdl = lgb.train(
                 local_params,
                 dtrain,
@@ -608,9 +610,9 @@ def train_multilevel_model(
     # Record host parallelization settings
     meta["cpu_count"] = int(cpu_count)
     meta["n_jobs"] = int(max(1, n_jobs if n_jobs is not None else 1))
-    meta["lgb_threads_per_trial"] = int(lgb_threads)
+    meta["lgb_threads_per_trial"] = int(_LGB_THREADS)
     if back_mask.any():
-        meta["backtest_days"] = int(backtest_days)
+        meta["backest_days"] = int(backtest_days)
         meta["backtest_metrics"] = backtest_metrics
 
     with open(meta_path, "w", encoding="utf-8") as f:
