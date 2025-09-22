@@ -11,6 +11,24 @@ from tkinter import ttk, messagebox, filedialog
 import numpy as np
 import pandas as pd
 
+
+def _maybe_start_virtual_display():
+    """
+    In headless environments (e.g., Google Colab) Tkinter requires an X display.
+    Start a virtual display if $DISPLAY is not set so the same Tk UI can initialize.
+    """
+    if os.environ.get("DISPLAY"):
+        return
+    try:
+        from pyvirtualdisplay import Display  # type: ignore
+        disp = Display(visible=0, size=(1280, 1024))
+        disp.start()
+        os.environ["DISPLAY"] = f":{disp.display}"
+        print(f"+ Started virtual display on {os.environ['DISPLAY']}")
+    except Exception as e:
+        # If this fails, the app will still raise the TclError later, but at least we log why.
+        print(f"! Could not start virtual display: {e}")
+
 # Ensure project root is on sys.path so `from src...` works regardless of CWD
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -847,6 +865,8 @@ class LiveApp(tk.Tk):
 
 
 def main():
+    # Ensure a display exists for Tk when running in headless environments like Colab
+    _maybe_start_virtual_display()
     app = LiveApp()
     app.mainloop()
 
