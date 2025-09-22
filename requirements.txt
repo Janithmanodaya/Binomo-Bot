@@ -11,3 +11,4 @@ yfinance>=0.2.40
 google-generativeai>=0.7.2
 requests>=2.32.3
 optuna>=3.6.0
+pyngrok>=7.1.6
