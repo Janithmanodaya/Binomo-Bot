@@ -19,6 +19,50 @@ from src.feature_lib import build_enriched_features  # enriched TA + macro + (op
 from src.run_pipeline import CostModel, tune_threshold_for_pnl
 
 
+def _maybe_add_gpu_params(params: Dict) -> Dict:
+    """
+    If a GPU is available and LightGBM has GPU support, add GPU params.
+    Falls back silently to CPU if unavailable at runtime.
+    """
+    p = dict(params)
+    if os.environ.get("FORCE_LGBM_CPU") == "1":
+        return p
+    try:
+        # Torch is commonly present in Colab and reflects CUDA availability
+        try:
+            import torch  # type: ignore
+            has_gpu = torch.cuda.is_available()
+        except Exception:
+            has_gpu = False
+        # Fallback heuristic: presence of nvidia-smi in PATH
+        if not has_gpu:
+            import shutil  # type: ignore
+            has_gpu = shutil.which("nvidia-smi") is not None
+        if has_gpu:
+            p["device_type"] = "gpu"  # LightGBM >=4 uses 'device_type'
+            p.setdefault("gpu_platform_id", 0)
+            p.setdefault("gpu_device_id", 0)
+    except Exception:
+        # Do not modify on any error
+        return params
+    return p
+
+
+def _lgb_train_with_gpu_fallback(params: Dict, dtrain, **kwargs):
+    """
+    Try GPU-accelerated training first; on error, retry with CPU params.
+    """
+    params_gpu = _maybe_add_gpu_params(params)
+    try:
+        return lgb.train(params_gpu, dtrain, **kwargs)
+    except Exception:
+        p_cpu = dict(params)
+        p_cpu.pop("device_type", None)
+        p_cpu.pop("gpu_platform_id", None)
+        p_cpu.pop("gpu_device_id", None)
+        return lgb.train(p_cpu, dtrain, **kwargs)
+
+
 @dataclass
 class AdvancedMeta:
     symbol: str
@@ -411,7 +455,7 @@ def train_multilevel_model(
                 X_va, y_va = X_all.loc[idx_va], y_all.loc[idx_va].map(class_to_idx)
                 dtrain = lgb.Dataset(X_tr, label=y_tr)
                 dval = lgb.Dataset(X_va, label=y_va)
-                model = lgb.train(
+                model = _lgb_train_with_gpu_fallback(
                     params,
                     dtrain,
                     num_boost_round=3000,
@@ -448,7 +492,7 @@ def train_multilevel_model(
         params.update(dict(objective="multiclass", num_class=5, metric=["multi_logloss"], verbose=-1, class_weight=class_weight_list))
         # Ensure thread setting is present
         params["num_threads"] = _LGB_THREADS
-        best_model = lgb.train(
+        best_model = _lgb_train_with_gpu_fallback(
             params,
             dtrain,
             num_boost_round=4000,
@@ -520,7 +564,7 @@ def train_multilevel_model(
         def run_one(_seed: int) -> Tuple[float, float, "lgb.Booster"]:
             local_params = _sample_params(np.random.RandomState(_seed), class_weight_list)
             local_params["num_threads"] = _LGB_THREADS
-            mdl = lgb.train(
+            mdl = _lgb_train_with_gpu_fallback(
                 local_params,
                 dtrain,
                 num_boost_round=4000,
