@@ -39,7 +39,7 @@ class LiveApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Crypto Live Signal (Tk)")
-        self.geometry("1100x780")
+        self.geometry("1100x820")
 
         # State
         self._live_thread: Optional[threading.Thread] = None
@@ -48,11 +48,18 @@ class LiveApp(tk.Tk):
 
         # Advanced model bundle (if loaded or trained)
         self._adv_bundle: Optional[Dict] = None
+        # Track model file mtimes for hot-reload/versioning
+        self._adv_model_mtime: Optional[float] = None
+        self._adv_meta_mtime: Optional[float] = None
 
         # Virtual orders
-        self._min_conf_var = tk.DoubleVar(value=0.30)
+        self._min_conf_var = tk.DoubleVar(value=0.80)  # confidence filter default 0.80
         self._pending_trade: Optional[Dict] = None  # keyed by last prediction
         self._trades: List[Dict] = []
+
+        # Running PnL metrics
+        self._cum_pnl: float = 0.0
+        self._cum_pnl_weighted: float = 0.0
 
         # Build UI
         try:
@@ -106,7 +113,7 @@ class LiveApp(tk.Tk):
         add_row(cfg, 4, "Train days (history):", ttk.Spinbox(cfg, from_=2, to=180, textvariable=self.live_train_days))
         add_row(cfg, 5, "Feature minutes (recent):", ttk.Spinbox(cfg, from_=500, to=5000, increment=100, textvariable=self.live_feat_minutes))
         add_row(cfg, 6, "Default decision threshold:", ttk.Spinbox(cfg, from_=0.50, to=0.90, increment=0.01, textvariable=self.live_default_thresh))
-        add_row(cfg, 7, "Min confidence (virtual trade):", ttk.Spinbox(cfg, from_=0.00, to=1.00, increment=0.01, textvariable=self._min_conf_var))
+        add_row(cfg, 7, "Min confidence (filter+trades):", ttk.Spinbox(cfg, from_=0.00, to=1.00, increment=0.01, textvariable=self._min_conf_var))
         # Break out widget creation to avoid very long argument lists on one line
         spin_trials = ttk.Spinbox(cfg, from_=1, to=200, increment=1, textvariable=self.adv_trials_var)
         add_row(cfg, 8, "Advanced trials (HPO):", spin_trials)
@@ -156,6 +163,7 @@ class LiveApp(tk.Tk):
         self.live_prob = tk.StringVar(value="—")
         self.live_signal = tk.StringVar(value="—")
         self.live_eval = tk.StringVar(value="—")
+        self.live_pnl = tk.StringVar(value="—")
 
         ttk.Label(live_stats, text="Status:", width=18).grid(row=0, column=0, sticky="w")
         ttk.Label(live_stats, textvariable=self.live_status).grid(row=0, column=1, sticky="w")
@@ -165,6 +173,8 @@ class LiveApp(tk.Tk):
         ttk.Label(live_stats, textvariable=self.live_signal).grid(row=2, column=1, sticky="w")
         ttk.Label(live_stats, text="Last evaluation:", width=18).grid(row=3, column=0, sticky="w")
         ttk.Label(live_stats, textvariable=self.live_eval).grid(row=3, column=1, sticky="w")
+        ttk.Label(live_stats, text="Cum PnL (w / raw):", width=18).grid(row=4, column=0, sticky="w")
+        ttk.Label(live_stats, textvariable=self.live_pnl).grid(row=4, column=1, sticky="w")
 
         # Logs and Trades
         lower = ttk.Panedwindow(frm, orient=tk.HORIZONTAL)
@@ -178,7 +188,7 @@ class LiveApp(tk.Tk):
         self.live_log.configure(yscrollcommand=lsb.set)
 
         tradesf = ttk.LabelFrame(lower, text="Virtual trades", padding=6)
-        cols = ("entry_ts", "side", "entry_price", "exit_ts", "exit_price", "confidence", "result", "pnl")
+        cols = ("entry_ts", "side", "entry_price", "exit_ts", "exit_price", "confidence", "result", "pnl", "pnl_w")
         self.trades_view = ttk.Treeview(tradesf, columns=cols, show="headings", height=18)
         for c in cols:
             self.trades_view.heading(c, text=c)
@@ -290,6 +300,7 @@ class LiveApp(tk.Tk):
             exit_price = prices["c1"] if prices else float("nan")
             entry_price = float(self._pending_trade["entry_price"])
             side = str(self._pending_trade["side"])
+            conf = float(self._pending_trade["confidence"])
             # Compute pnl in log-return terms cost-aware
             tau = 2.0 * (float(self.taker_var.get()) + float(self.slip_var.get())) / 10000.0
             pnl = 0.0
@@ -302,24 +313,41 @@ class LiveApp(tk.Tk):
                 elif side == "SHORT":
                     pnl = -next_ret - tau
                     result = "WIN" if pnl > 0 else "LOSS"
-            # Prefer correctness flag if provided
+            # Prefer correctness flag if provided to set WIN/LOSS label (does not change pnl calc)
             if correct is not None:
                 result = "WIN" if bool(correct) else "LOSS" if side in ("LONG", "SHORT") else "FLAT"
+
+            # Confidence-weighted PnL multiplier:
+            # Map confidence in [0,1] to weight ~ [0.1, 2.0], with examples:
+            # 0.50 -> 0.5x, 0.90 -> 1.5x
+            def _weight(c: float) -> float:
+                w = 0.5 + 2.5 * (float(c) - 0.5)  # linear map hitting the given examples
+                return float(max(0.1, min(2.0, w)))
+
+            pnl_w = float(pnl * _weight(conf))
+
             trade = dict(
                 entry_ts=entry_ts_local,
                 side=side,
                 entry_price=float(entry_price),
                 exit_ts=ts_local_str,
                 exit_price=float(exit_price) if prices else float("nan"),
-                confidence=float(self._pending_trade["confidence"]),
+                confidence=conf,
                 result=result,
                 pnl=float(pnl),
+                pnl_w=float(pnl_w),
             )
             self._trades.append(trade)
+
+            # Update cumulative metrics
+            self._cum_pnl += float(pnl)
+            self._cum_pnl_weighted += float(pnl_w)
+            self.live_pnl.set(f"{self._cum_pnl_weighted:.3e} / {self._cum_pnl:.3e}")
+
             self.trades_view.insert("", tk.END, values=(
                 trade["entry_ts"], trade["side"], f"{trade['entry_price']:.6f}",
                 trade["exit_ts"], f"{trade['exit_price']:.6f}" if not np.isnan(trade["exit_price"]) else "NaN",
-                f"{trade['confidence']:.2f}", trade["result"], f"{trade['pnl']:.3e}"
+                f"{trade['confidence']:.2f}", trade["result"], f"{trade['pnl']:.3e}", f"{trade['pnl_w']:.3e}"
             ))
         finally:
             self._pending_trade = None
@@ -358,6 +386,13 @@ class LiveApp(tk.Tk):
             self._adv_bundle = load_advanced_bundle()
             if self._adv_bundle is None:
                 raise RuntimeError("Advanced model files not found after training.")
+            # Track mtimes for versioning
+            try:
+                self._adv_model_mtime = os.path.getmtime("data/processed/advanced_model.txt")
+                self._adv_meta_mtime = os.path.getmtime("data/processed/advanced_meta.json")
+            except Exception:
+                self._adv_model_mtime = None
+                self._adv_meta_mtime = None
             meta = self._adv_bundle["meta"]
             thr = float(meta.get("threshold", float(self.live_default_thresh.get())))
             self.train_progress["value"] = 100
@@ -417,6 +452,13 @@ class LiveApp(tk.Tk):
                 meta = json.load(f)
             booster = lgb.Booster(model_file=model_path)
             self._adv_bundle = {"booster": booster, "meta": meta}
+            # Track mtimes for versioning (best-effort)
+            try:
+                self._adv_model_mtime = os.path.getmtime(model_path)
+                self._adv_meta_mtime = os.path.getmtime(meta_path)
+            except Exception:
+                self._adv_model_mtime = None
+                self._adv_meta_mtime = None
             thr = float(meta.get("threshold", float(self.live_default_thresh.get())))
             self.live_status.set(f"Loaded model (threshold={thr:.2f})")
             self._append_live_log(f"Loaded model:\n- model: {model_path}\n- meta: {meta_path}\n")
@@ -497,12 +539,18 @@ class LiveApp(tk.Tk):
             prob = float(msg.get("prob_up")) if msg.get("prob_up") is not None else float("nan")
             conf = float(msg.get("confidence")) if msg.get("confidence") is not None else 0.0
             sig = int(msg.get("signal")) if msg.get("signal") is not None else 0
+            min_conf = float(self._min_conf_var.get())
             self.live_prob.set(f"{prob:.3f} (conf {conf:.2f}) @ {ts_local}")
-            sig_str = "LONG" if sig == 1 else ("SHORT" if sig == -1 else "FLAT")
+            if conf < min_conf or sig == 0:
+                sig_str = "FLAT (filtered)" if sig != 0 else "FLAT"
+                eff_sig = 0
+            else:
+                sig_str = "LONG" if sig == 1 else "SHORT"
+                eff_sig = sig
             self.live_signal.set(sig_str)
             self._append_live_log(f"Prediction {ts_local}: prob_up={prob:.3f}, confidence={conf:.2f}, signal={sig_str}\n")
-            # Virtual order: maybe open
-            self._maybe_open_virtual_trade(self.symbol_var.get(), sig, conf, ts_local)
+            # Virtual order: maybe open (only if passes filter)
+            self._maybe_open_virtual_trade(self.symbol_var.get(), eff_sig, conf, ts_local)
         elif evt == "evaluation":
             ts_local = str(msg.get("timestamp"))
             correct = msg.get("correct")
@@ -510,6 +558,41 @@ class LiveApp(tk.Tk):
             self._append_live_log(f"Evaluation for {ts_local}: {'Correct' if correct else 'Wrong'}\n")
             # Close virtual trade if one pending for this timestamp
             self._close_virtual_trade(self.symbol_var.get(), ts_local, correct=bool(correct) if correct is not None else None)
+            # Persist live feedback for (future) online learning
+            try:
+                os.makedirs("data/feedback", exist_ok=True)
+                path = "data/feedback/live_feedback.csv"
+                # Record minimal schema; features will be rebuilt during retraining
+                rec = {
+                    "timestamp_local": ts_local,
+                    "symbol": self.symbol_var.get(),
+                    "min_conf": float(self._min_conf_var.get()),
+                    "taker_fee_bps": float(self.taker_var.get()),
+                    "slippage_bps": float(self.slip_var.get()),
+                    "correct": bool(correct) if correct is not None else None,
+                }
+                # Also attach last prediction line if available from UI state
+                rec["last_prob_up"] = None
+                rec["last_confidence"] = None
+                rec["last_signal"] = self.live_signal.get()
+                try:
+                    # Parse from live_prob string
+                    lp = self.live_prob.get()
+                    # Format e.g. "0.612 (conf 0.85) @ 2024-..."; extract numbers safely
+                    import re
+                    m = re.search(r"([0-9.]+) \\(conf ([0-9.]+)\\)", lp)
+                    if m:
+                        rec["last_prob_up"] = float(m.group(1))
+                        rec["last_confidence"] = float(m.group(2))
+                except Exception:
+                    pass
+                df_one = pd.DataFrame([rec])
+                if os.path.exists(path):
+                    df_one.to_csv(path, mode="a", header=False, index=False)
+                else:
+                    df_one.to_csv(path, index=False)
+            except Exception:
+                pass
         elif evt == "error":
             self._append_live_log(f"Error: {msg.get('message')}\n")
         else:
@@ -527,6 +610,9 @@ class LiveApp(tk.Tk):
         self._stop_event.clear()
         self._pending_trade = None
         self._trades.clear()
+        self._cum_pnl = 0.0
+        self._cum_pnl_weighted = 0.0
+        self.live_pnl.set("0.000e+00 / 0.000e+00")
         for item in self.trades_view.get_children():
             self.trades_view.delete(item)
 
@@ -601,6 +687,13 @@ class LiveApp(tk.Tk):
                 self._append_live_log("Using loaded advanced model bundle.\n")
 
             bundle = self._adv_bundle
+            # Capture current mtimes if available
+            try:
+                self._adv_model_mtime = os.path.getmtime("data/processed/advanced_model.txt")
+                self._adv_meta_mtime = os.path.getmtime("data/processed/advanced_meta.json")
+            except Exception:
+                self._adv_model_mtime = None
+                self._adv_meta_mtime = None
             meta = bundle["meta"]
             thr = float(meta.get("threshold", float(self.live_default_thresh.get())))
             self.live_status.set(f"Model ready (threshold={thr:.2f})")
@@ -630,6 +723,26 @@ class LiveApp(tk.Tk):
 
             # Live prediction loop
             while not self._stop_event.is_set():
+                # Hot-reload model if newer files are available (model versioning)
+                try:
+                    model_path = "data/processed/advanced_model.txt"
+                    meta_path = "data/processed/advanced_meta.json"
+                    if os.path.exists(model_path) and os.path.exists(meta_path):
+                        m_m = os.path.getmtime(model_path)
+                        m_j = os.path.getmtime(meta_path)
+                        if (self._adv_model_mtime is None) or (self._adv_meta_mtime is None) or (m_m > self._adv_model_mtime) or (m_j > self._adv_meta_mtime):
+                            new_bundle = load_advanced_bundle()
+                            if new_bundle is not None:
+                                bundle = new_bundle
+                                meta = bundle["meta"]
+                                thr = float(meta.get("threshold", float(self.live_default_thresh.get())))
+                                self._adv_bundle = bundle
+                                self._adv_model_mtime = m_m
+                                self._adv_meta_mtime = m_j
+                                self._on_live_update({"event": "model_ready", "threshold": thr})
+                except Exception:
+                    pass
+
                 thr_override = float(self.adv_threshold_var.get())
                 ts, prob_up, strength, conf = adv_predict_latest(
                     symbol=symbol,

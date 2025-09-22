@@ -159,12 +159,33 @@ def build_rich_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Build an extended set of minute features using only OHLCV.
     Includes multi-timeframe aggregates to improve separability and confidence.
-    """
-    out = df.copy()
-    out = _add_minute_level_features(out)
-    # Multi-timeframe joins: 3m, 5m, 15m
-    # Use 'min' instead of deprecated 'T' alias
-    out = _add_multi_timeframe_features(df, out, tfs=["3min", "5min", "15min"])
 
-    out = out.replace([np.inf, -np.inf], np.nan).dropna().copy()
-    return out
+    Robust to short lookbacks: if there is not enough data to compute indicators,
+    returns an empty DataFrame instead of raising, allowing callers to skip gracefully.
+    """
+    try:
+        if df is None or df.empty:
+            return pd.DataFrame(index=pd.DatetimeIndex([], tz="UTC"))
+
+        # Ensure a DatetimeIndex with UTC tz
+        base = df.copy()
+        if not isinstance(base.index, pd.DatetimeIndex):
+            return pd.DataFrame(index=pd.DatetimeIndex([], tz="UTC"))
+        if base.index.tz is None:
+            base.index = base.index.tz_localize("UTC")
+        else:
+            base.index = base.index.tz_convert("UTC")
+
+        # Require a minimal window to compute stable rolling stats
+        if len(base) < 220:  # enough to compute 200-roll stats without all-NaN
+            return pd.DataFrame(index=base.index)
+
+        out = _add_minute_level_features(base)
+        # Multi-timeframe joins: 3m, 5m, 15m
+        out = _add_multi_timeframe_features(base, out, tfs=["3min", "5min", "15min"])
+
+        out = out.replace([np.inf, -np.inf], np.nan).dropna().copy()
+        return out
+    except Exception:
+        # On any failure, return empty to signal caller to skip this tick
+        return pd.DataFrame(index=(df.index if isinstance(df.index, pd.DatetimeIndex) else None))
