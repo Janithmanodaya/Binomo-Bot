@@ -40,8 +40,17 @@ def main():
         run(f'"{sys.executable}" -m streamlit run "{ui_script}" --server.port {port}')
         return
 
+    # Colab-friendly web launcher (Streamlit + ngrok)
+    if "--colab" in args or "colab" in args:
+        colab_script = os.path.join("src", "colab_web.py")
+        if not os.path.exists(colab_script):
+            print(f"{colab_script} not found.")
+            raise SystemExit(1)
+        run(f'"{sys.executable}" "{colab_script}"')
+        return
+
     # Otherwise forward all args to the pipeline
-    extra_args = [a for a in sys.argv[1:] if a not in {"--ui", "ui", "--streamlit", "--tk", "tk"}]
+    extra_args = [a for a in sys.argv[1:] if a not in {"--ui", "ui", "--streamlit", "--tk", "tk", "--colab", "colab"}]
     extra = " ".join([f'"{a}"' if " " in a else a for a in extra_args])
     script = os.path.join("src", "run_pipeline.py")
     if not os.path.exists(script):

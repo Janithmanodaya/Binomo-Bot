@@ -31,6 +31,25 @@ Or use the UI (recommended for exploration)
    # If the browser doesn't open automatically, go to:
    # http://localhost:8501
 
+Run on Google Colab (web UI, keeps Tk UI for desktop)
+- This project includes a Colab-friendly launcher that exposes the existing Streamlit UI via an ngrok public URL. The Tkinter desktop app is preserved for local use; nothing was removed.
+- Steps in a Colab cell:
+   !git clone YOUR_REPO_URL
+   %cd YOUR_REPO_FOLDER
+   !python -m pip install -r requirements.txt
+   # Optional: set your ngrok token for a stable public URL
+   import os
+   os.environ["NGROK_AUTH_TOKEN"] = "YOUR_TOKEN"  # or NGROK_TOKEN
+   # Launch the web UI and get a public URL
+   !python run.py --colab
+- The notebook output will print a line like:
+   ================= PUBLIC URL =================
+   https://xxxxxxxx.ngrok.io
+   ==============================================
+  Click that URL to access the UI from your browser while the Colab runtime is running.
+- You can change the port by setting UI_PORT, e.g.:
+   os.environ["UI_PORT"] = "8502"
+
 UI tabs
 - Backtest: run cost-aware walk-forward with progress and charts.
 - Realtime (rich): train a rich-feature LightGBM model and preview minute-by-minute predictions with online correctness and confidence.
