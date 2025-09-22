@@ -4,31 +4,44 @@ import time
 import subprocess
 from typing import Optional
 
-# This helper launches the existing Streamlit UI and exposes it publicly in Google Colab
-# using an ngrok tunnel. The Tkinter app remains available via `python run.py --tk` locally.
 
-def _install_if_missing(pkg: str):
+# This helper launches the existing Streamlit UI.
+# In Google Colab, it prints a direct Colab proxy URL (no tunneling required).
+# Outside Colab, it just runs Streamlit locally.
+
+
+def _in_colab() -> bool:
     try:
-        __import__(pkg)
+        import google.colab  # type: ignore
+        return True
     except Exception:
-        print(f"+ Installing missing dependency: {pkg}")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+        return False
+
+
+def _colab_proxy_url(port: int, retries: int = 30, delay: float = 1.0) -> Optional[str]:
+    """
+    Ask Colab to proxy the given local port and return a direct URL on the colab domain.
+    Retries for a short period until the server responds.
+    """
+    try:
+        from google.colab import output  # type: ignore
+    except Exception:
+        return None
+
+    url: Optional[str] = None
+    for _ in range(max(1, retries)):
+        try:
+            # This returns a fully qualified URL on the Colab domain
+            url = output.eval_js(f"google.colab.kernel.proxyPort({int(port)})")  # type: ignore
+            if isinstance(url, str) and url.startswith("http"):
+                return url
+        except Exception:
+            pass
+        time.sleep(delay)
+    return url
+
 
 def main():
-    # Ensure pyngrok is available
-    _install_if_missing("pyngrok")
-
-    from pyngrok import ngrok  # type: ignore
-
-    # Configure auth token if provided
-    token = os.environ.get("NGROK_AUTH_TOKEN") or os.environ.get("NGROK_TOKEN")
-    if token:
-        try:
-            ngrok.set_auth_token(token)
-            print("+ ngrok auth token configured")
-        except Exception as e:
-            print(f"! Failed to set ngrok token: {e}")
-
     # Determine port and UI script
     port = int(os.environ.get("UI_PORT", "8501"))
     ui_script = os.path.join("src", "ui_app.py")
@@ -48,28 +61,34 @@ def main():
     print("+ Command:", " ".join(streamlit_cmd))
     st_proc = subprocess.Popen(streamlit_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
-    # Open public tunnel
-    print(f"+ Opening ngrok tunnel on port {port} ...")
-    public_url = None
-    try:
-        http_tunnel = ngrok.connect(port, "http")
-        public_url = http_tunnel.public_url
-        print("\n================= PUBLIC URL =================")
-        print(public_url)
-        print("==============================================\n")
-        print("Tip: In Google Colab, click the URL above to open the web UI.\n")
-    except Exception as e:
-        print(f"! Failed to open ngrok tunnel: {e}")
-        print("You can still access via the notebook proxy or local port forwarding if available.")
+    public_url: Optional[str] = None
 
-    # Stream logs to console for visibility in Colab
+    if _in_colab():
+        print("+ Detected Google Colab environment. Preparing Colab proxy URL ...")
+        # Give Streamlit a moment to bind, then ask Colab for the proxy URL
+        time.sleep(2.0)
+        public_url = _colab_proxy_url(port)
+        if public_url:
+            print("\n================= COLAB URL =================")
+            print(public_url)
+            print("=============================================\n")
+            print("Tip: Click the URL above to open the Streamlit UI in Colab.\n")
+        else:
+            print("! Could not get Colab proxy URL yet. The UI may still be starting; logs follow below.")
+    else:
+        print(f"+ Streamlit running locally at http://0.0.0.0:{port}")
+
+    # Stream logs to console for visibility
     try:
         assert st_proc.stdout is not None
         for line in st_proc.stdout:
             print(line, end="")
-            # Print the public URL periodically to keep it visible
-            if public_url and ("Network URL" in line or "Local URL" in line):
-                print(f"\n[Public URL] {public_url}\n")
+            # When running in Colab, try again to fetch the proxy URL once Streamlit reports readiness
+            if _in_colab() and public_url is None and ("Network URL" in line or "Local URL" in line or "You can now view your Streamlit app" in line):
+                url = _colab_proxy_url(port, retries=5, delay=1.0)
+                if url:
+                    public_url = url
+                    print(f"\n[Colab URL] {public_url}\n")
     except KeyboardInterrupt:
         pass
     finally:
@@ -77,10 +96,7 @@ def main():
             st_proc.terminate()
         except Exception:
             pass
-        try:
-            ngrok.kill()
-        except Exception:
-            pass
+
 
 if __name__ == "__main__":
     main()
