@@ -25,18 +25,46 @@ except Exception:
 from src.features_ta import build_rich_features  # type: ignore
 import lightgbm as lgb  # type: ignore
 
+# Sentiment (Gemini) helper
+try:
+    from src.sentiment_gemini import analyze_sentiment_gemini  # type: ignore
+except Exception:
+    analyze_sentiment_gemini = None  # type: ignore
+
 
 st.set_page_config(page_title="Live Crypto Signal — Realtime + Advanced", layout="wide")
 st.title("Live Crypto Signal — Realtime + Advanced (cost-aware)")
 
 # Build/version banner to verify UI is up to date
-UI_VERSION = "v0.4.0 (live-only UI)"
+UI_VERSION = "v0.5.0 (macro + on-chain + Gemini sentiment)"
 try:
     mtime = os.path.getmtime(__file__)
     ts = pd.to_datetime(mtime, unit="s")
     st.caption(f"UI build: {UI_VERSION} | ui_app.py last modified: {ts} UTC")
 except Exception:
     st.caption(f"UI build: {UI_VERSION}")
+
+# Sidebar: optional Gemini API + sentiment input
+with st.sidebar:
+    st.subheader("Sentiment (Gemini)")
+    gemini_api_key = st.text_input("Google Gemini API key", type="password", help="Used locally to score sentiment from headlines/news")
+    default_text = st.session_state.get("sentiment_text", "")
+    sentiment_text = st.text_area("Headlines / Notes (one paragraph or list)", value=default_text, height=150)
+    analyze_btn = st.button("Analyze sentiment", use_container_width=True)
+    if analyze_btn and analyze_sentiment_gemini is not None and gemini_api_key and sentiment_text.strip():
+        try:
+            score, summary = analyze_sentiment_gemini(sentiment_text, gemini_api_key)
+            st.session_state["sentiment_text"] = sentiment_text
+            st.session_state["sentiment_score"] = float(score)
+            st.session_state["sentiment_summary"] = summary
+            st.success(f"Sentiment score: {score:.3f}  (-1..1)")
+            st.caption(summary)
+        except Exception as e:
+            st.error(f"Gemini error: {e}")
+    elif analyze_btn and (not gemini_api_key or analyze_sentiment_gemini is None):
+        st.warning("Provide a valid Gemini API key to compute sentiment.")
+    sent_score = float(st.session_state.get("sentiment_score", 0.0))
+    st.metric("Manual sentiment score", f"{sent_score:+.3f}", help="This value is optionally injected as a feature if the model expects it.")
 
 tabs = st.tabs(["Realtime (rich)", "Live (advanced)"])
 
@@ -306,10 +334,14 @@ with tabs[1]:
             pending_trade: Optional[Dict] = None
 
             for i in range(int(adv_minutes)):
-                ts, prob_up, signal, confidence = predict_latest(adv_symbol, feature_minutes=1200, bundle=bundle)
+                # Inject optional sentiment feature if present; model will ignore if not trained with it
+                extra = {}
+                if "sentiment_score" in st.session_state:
+                    extra["sentiment_manual"] = float(st.session_state["sentiment_score"])
+                ts, prob_up, signal, confidence = predict_latest(adv_symbol, feature_minutes=1800, bundle=bundle, extra_features=extra)
                 signal_str = {2: "LONG x2", 1: "LONG", 0: "FLAT", -1: "SHORT", -2: "SHORT x2"}[int(signal)]
 
-                rows.append(dict(timestamp=ts, prob_up=prob_up, confidence=confidence, signal=signal, signal_str=signal_str))
+                rows.append(dict(timestamp=ts, prob_up=prob_up, confidence=confidence, signal=signal, signal_str=signal_str, sentiment=extra.get("sentiment_manual", 0.0)))
                 df_rows = pd.DataFrame(rows)
                 ph_table.dataframe(df_rows.tail(50), use_container_width=True)
                 ph_status.info(f"[{i+1}/{int(adv_minutes)}] {ts} prob_up={prob_up:.4f} conf={confidence:.3f} signal={signal_str}")

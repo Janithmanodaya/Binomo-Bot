@@ -9,7 +9,7 @@ import pandas as pd
 import ccxt
 import lightgbm as lgb
 
-from src.features_ta import build_rich_features
+from src.feature_lib import build_enriched_features  # enriched TA + macro + (optional) on-chain
 from src.run_pipeline import CostModel, tune_threshold_for_pnl
 
 
@@ -249,7 +249,7 @@ def train_multilevel_model(
     raw_path = f"data/raw/{symbol.replace('/', '')}_1m_adv.parquet"
     df.to_parquet(raw_path)
     report("Building features", 0.10)
-    feats = build_rich_features(df)
+    feats = build_enriched_features(df, symbol)
 
     report("Labeling (multi-level)", 0.18)
     labeled = build_multi_level_labels(feats, cost)
@@ -445,10 +445,14 @@ def predict_latest(
     feature_minutes: int,
     bundle: Dict,
     threshold_override: Optional[float] = None,
+    extra_features: Optional[Dict[str, float]] = None,
 ) -> Tuple[pd.Timestamp, float, int, float]:
     """
     Predict on the latest completed minute using the advanced model.
     Returns (timestamp, prob_up, signal_strength in {-2..2}, confidence)
+
+    extra_features: optional dict of additional feature_name -> value (e.g., sentiment_manual)
+                    Only applied if the feature exists in the trained model's feature list.
     """
     booster: lgb.Booster = bundle["booster"]
     meta = bundle["meta"]
@@ -468,11 +472,19 @@ def predict_latest(
     raw["timestamp"] = pd.to_datetime(raw["timestamp"], unit="ms", utc=True)
     raw = raw.set_index("timestamp").sort_index().drop_duplicates()
 
-    feats = build_rich_features(raw)
+    # Build enriched features (includes macro/on-chain when available)
+    feats = build_enriched_features(raw, symbol)
     if feats.empty:
         raise RuntimeError("Insufficient features for prediction.")
     ts = feats.index[-1]
     X_row = feats.iloc[[-1]].copy()
+
+    # Inject any provided extra features if the model expects them
+    if extra_features:
+        for k, v in extra_features.items():
+            if k in feature_names:
+                X_row[k] = float(v)
+
     # Align columns
     for col in feature_names:
         if col not in X_row.columns:
