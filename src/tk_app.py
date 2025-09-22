@@ -74,7 +74,7 @@ class LiveApp(tk.Tk):
         self.taker_var = tk.DoubleVar(value=4.0)
         self.slip_var = tk.DoubleVar(value=1.0)
 
-        self.live_train_days = tk.IntVar(value=7)
+        self.live_train_days = tk.IntVar(value=60)
         self.live_feat_minutes = tk.IntVar(value=2000)
         self.live_default_thresh = tk.DoubleVar(value=0.55)
 
