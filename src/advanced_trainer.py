@@ -275,11 +275,10 @@ def train_multilevel_model(
 
     # Determine host capabilities and parallelization plan
     cpu_count, mem_gb = _host_caps()
-    # Default: half the CPUs for parallel trials, at least 1, cap at 8 by default
+    # More aggressive default parallelism: use most of the CPUs, cap at 16 by default
     if n_jobs is None or int(n_jobs) <= 0:
-        n_jobs = max(1, min(8, cpu_count // 2 if cpu_count >= 2 else 1))
-    # Each LightGBM training uses its own threads. Reserve threads per trial.
-    lgb_threads = max(1, cpu_count // int(max(1, n_jobs)))
+        n_jobs = max(1, min(16, cpu_count - 1 if cpu_count >= 3 else cpu_count))
+    # Each LightGBM training uses its own threads. Reserve threads per trial to avoid oversubu_count // int(max(1, n_jobs)))
 
     report("Labeling (multi-level)", 0.18)
     labeled = build_multi_level_labels(feats, cost)
@@ -431,6 +430,8 @@ def train_multilevel_model(
         best_params = study.best_trial.params
         # Ensure final params carry our thread setting
         best_params["num_threads"] = int(lgb_threads)
+        # Report chosen parallelism
+        report(f"Optuna parallel trials: {int(max(1, n_jobs))}, LGBM threads/trial: {int(lgb_threads)}", 0.72)
 
         # Train a final model on 85/15 split (kept for threshold tuning) using best params
         split = int(n_tv * 0.85)

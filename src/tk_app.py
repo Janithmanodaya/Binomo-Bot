@@ -383,6 +383,7 @@ class LiveApp(tk.Tk):
                 progress=on_prog,
                 trials=int(self.adv_trials_var.get()),
                 backtest_days=int(self.adv_backtest_days_var.get()),
+                n_jobs=int(self.adv_jobs_var.get()),
             )
             self._adv_bundle = load_advanced_bundle()
             if self._adv_bundle is None:
