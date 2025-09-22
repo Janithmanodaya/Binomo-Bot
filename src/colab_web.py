@@ -6,7 +6,7 @@ from typing import Optional
 
 
 # This helper launches the existing Streamlit UI.
-# In Google Colab, it prints a direct Colab proxy URL (no tunneling required).
+# In Google Colab, it prints a direct Colab proxy URL (no tunneling).
 # Outside Colab, it just runs Streamlit locally.
 
 
@@ -18,10 +18,10 @@ def _in_colab() -> bool:
         return False
 
 
-def _colab_proxy_url(port: int, retries: int = 30, delay: float = 1.0) -> Optional[str]:
+def _colab_proxy_url(port: int, retries: int = 120, delay: float = 0.5) -> Optional[str]:
     """
-    Ask Colab to proxy the given local port and return a direct URL on the colab domain.
-    Retries for a short period until the server responds.
+    Ask Colab to proxy the given local port and return a direct URL on the Colab domain.
+    Retries for a while until the server responds (longer/harder than default).
     """
     try:
         from google.colab import output  # type: ignore
@@ -31,7 +31,7 @@ def _colab_proxy_url(port: int, retries: int = 30, delay: float = 1.0) -> Option
     url: Optional[str] = None
     for _ in range(max(1, retries)):
         try:
-            # This returns a fully qualified URL on the Colab domain
+            # Returns a fully qualified URL on the Colab domain
             url = output.eval_js(f"google.colab.kernel.proxyPort({int(port)})")  # type: ignore
             if isinstance(url, str) and url.startswith("http"):
                 return url
@@ -66,7 +66,7 @@ def main():
     if _in_colab():
         print("+ Detected Google Colab environment. Preparing Colab proxy URL ...")
         # Give Streamlit a moment to bind, then ask Colab for the proxy URL
-        time.sleep(2.0)
+        time.sleep(3.0)
         public_url = _colab_proxy_url(port)
         if public_url:
             print("\n================= COLAB URL =================")
@@ -79,16 +79,25 @@ def main():
         print(f"+ Streamlit running locally at http://0.0.0.0:{port}")
 
     # Stream logs to console for visibility
+    # While streaming logs, keep retrying the Colab proxy periodically until we get it.
+    last_retry = 0.0
     try:
         assert st_proc.stdout is not None
         for line in st_proc.stdout:
             print(line, end="")
-            # When running in Colab, try again to fetch the proxy URL once Streamlit reports readiness
-            if _in_colab() and public_url is None and ("Network URL" in line or "Local URL" in line or "You can now view your Streamlit app" in line):
-                url = _colab_proxy_url(port, retries=5, delay=1.0)
-                if url:
-                    public_url = url
-                    print(f"\n[Colab URL] {public_url}\n")
+            now = time.time()
+            # When running in Colab, try again to fetch the proxy URL:
+            # - once Streamlit reports readiness, or
+            # - periodically (every ~5s) until obtained.
+            if _in_colab() and public_url is None:
+                trigger = ("Network URL" in line) or ("Local URL" in line) or ("You can now view your Streamlit app" in line)
+                periodic = (now - last_retry) > 5.0
+                if trigger or periodic:
+                    url = _colab_proxy_url(port, retries=10, delay=0.5)
+                    last_retry = now
+                    if url:
+                        public_url = url
+                        print(f"\n[Colab URL] {public_url}\n")
     except KeyboardInterrupt:
         pass
     finally:
