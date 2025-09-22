@@ -302,11 +302,21 @@ def train_multilevel_model(
     import lightgbm as lgb
 
     # Custom PnL evaluation metric (higher is better) - uses fold's validation segment
-    def make_pnl_feval(X_va_idx: pd.Index, next_ret_series: pd.Series):
-        X_va_idx = pd.Index(X_va_idx)
-        next_ret = next_ret_series.loc[X_va_idx]
+    def make_pnl_feval(tr_idx: pd.Index, va_idx: pd.Index, next_ret_series: pd.Series):
+        next_ret_tr = next_ret_series.loc[tr_idx].values
+        next_ret_va = next_ret_series.loc[va_idx].values
+        len_tr, len_va = len(next_ret_tr), len(next_ret_va)
+
         def pnl_feval(y_pred: np.ndarray, dset: "lgb.Dataset"):
             n = dset.num_data()
+            if n == len_tr:
+                nr = next_ret_tr
+            elif n == len_va:
+                nr = next_ret_va
+            else:
+                # This case should not be hit if used correctly with dtrain/dval
+                return ("val_mean_pnl", -1e9, True)
+
             proba = y_pred.reshape(n, 5)
             p_down2 = proba[:, class_to_idx[-2]]
             p_down1 = proba[:, class_to_idx[-1]]
@@ -321,7 +331,6 @@ def train_multilevel_model(
             thresholds = np.linspace(0.6, 0.75, 11)
             rt_cost = cost.roundtrip_cost_ret
             best = -1e9
-            nr = next_ret.values[:n]
             for t in thresholds:
                 sig = np.where(p_up_cond >= t, 1, np.where(p_up_cond <= 1 - t, -1, 0))
                 pnl = np.where(sig == 1, nr - rt_cost, np.where(sig == -1, -nr - rt_cost, 0.0))
@@ -375,7 +384,7 @@ def train_multilevel_model(
                     num_boost_round=3000,
                     valid_sets=[dtrain, dval],
                     valid_names=["train", "valid"],
-                    feval=make_pnl_feval(idx_va, labeled["next_ret"]),
+                    feval=make_pnl_feval(idx_tr, idx_va, labeled["next_ret"]),
                     callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)],
                 )
                 # Evaluate mean pnl on this fold using the live eval function
@@ -404,7 +413,7 @@ def train_multilevel_model(
             num_boost_round=4000,
             valid_sets=[dtrain, dval],
             valid_names=["train", "valid"],
-            feval=make_pnl_feval(idx_va_final, labeled["next_ret"]),
+            feval=make_pnl_feval(idx_tr_final, idx_va_final, labeled["next_ret"]),
             callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)],
         )
         best_thr, best_score = _eval_model_pnl(best_model, X_va, labeled.loc[idx_va_final, "next_ret"], class_to_idx, cost, min_confidence=0.20)
@@ -416,7 +425,8 @@ def train_multilevel_model(
         idx_va = tv_idx_sorted[split:]
         X_tr, y_tr = X_all.loc[idx_tr], y_all.loc[idx_tr]
         X_va, y_va = X_all.loc[idx_va], y_all.loc[idx_va]
-        next_ret_va = labeled.loc[idx_va, "next_ret"]
+        next_ret_tr = labeled.loc[idx_tr, "next_ret"].values
+        next_ret_va = labeled.loc[idx_va, "next_ret"].values
         y_tr_idx = y_tr.map(class_to_idx)
         y_va_idx = y_va.map(class_to_idx)
 
@@ -425,6 +435,13 @@ def train_multilevel_model(
 
         def pnl_feval(y_pred: np.ndarray, dset: "lgb.Dataset"):
             n = dset.num_data()
+            if n == len(X_tr):
+                nr = next_ret_tr
+            elif n == len(X_va):
+                nr = next_ret_va
+            else:
+                return ("val_mean_pnl", -1e9, True)
+
             proba = y_pred.reshape(n, 5)
             p_down2 = proba[:, class_to_idx[-2]]
             p_down1 = proba[:, class_to_idx[-1]]
@@ -435,14 +452,19 @@ def train_multilevel_model(
             p_nonflat = p_up_raw + p_down_raw
             with np.errstate(divide="ignore", invalid="ignore"):
                 p_up_cond = np.where(p_nonflat > 1e-12, p_up_raw / p_nonflat, 0.5)
-            p_up_s = pd.Series(p_up_cond, index=X_va.index[:n])
+
+            # This Series creation is not strictly necessary for the logic but was in the original
+            # except block. To minimize changes, we'll keep a similar structure, but ensure it
+            # doesn't cause an error by using a generic range index. The `p_up_cond` array is all
+            # that's used in the calculation.
+            p_up_s = pd.Series(p_up_cond)
             thresholds = np.linspace(0.6, 0.75, 11)
             rt_cost = cost.roundtrip_cost_ret
             best = -1e9
             for t in thresholds:
                 sig = np.where(p_up_s >= t, 1, np.where(p_up_s <= 1 - t, -1, 0))
-                pnl = np.where(sig == 1, next_ret_va.values[:n] - rt_cost,
-                               np.where(sig == -1, -next_ret_va.values[:n] - rt_cost, 0.0))
+                pnl = np.where(sig == 1, nr - rt_cost,
+                               np.where(sig == -1, -nr - rt_cost, 0.0))
                 m = float(np.mean(pnl))
                 if m > best:
                     best = m
