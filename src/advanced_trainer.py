@@ -298,6 +298,8 @@ def train_multilevel_model(
     trials: int = 60,
     backtest_days: int = 0,
     n_jobs: Optional[int] = None,
+    hpo_pruning: bool = True,
+    hpo_narrow: bool = True,
 ) -> Tuple[str, str]:
     """
     Train a multi-level (5-class) LightGBM model and save to data/processed/.
@@ -426,26 +428,84 @@ def train_multilevel_model(
     try:
         import optuna  # type: ignore
 
+        # Try to load previous best params for narrowing
+        prev_best: Optional[Dict] = None
+        try:
+            with open("data/processed/advanced_meta.json", "r", encoding="utf-8") as _f:
+                _meta_prev = json.load(_f)
+                prev_best = _meta_prev.get("best_params")
+        except Exception:
+            prev_best = None
+
+        def _narrow(a: float, low: float, high: float, ratio: float = 0.3) -> Tuple[float, float]:
+            width = max(1e-12, (high - low) * ratio)
+            lo = max(low, a - width)
+            hi = min(high, a + width)
+            if lo >= hi:
+                lo, hi = low, high
+            return float(lo), float(hi)
+
         def objective(trial: "optuna.Trial") -> float:
+            # Global ranges
+            nl_lo, nl_hi = 64, 256
+            lr_lo, lr_hi = 0.01, 0.08
+            ff_lo, ff_hi = 0.6, 0.95
+            bf_lo, bf_hi = 0.6, 0.95
+            bfq_lo, bfq_hi = 1, 6
+            mleaf_lo, mleaf_hi = 50, 400
+            l1_lo, l1_hi = 1e-3, 10.0
+            l2_lo, l2_hi = 1e-3, 10.0
+            mgt_lo, mgt_hi = 1e-3, 5.0
+            subs_lo, subs_hi = 0.6, 0.95
+
+            # Narrow around previous best if available
+            if hpo_narrow and isinstance(prev_best, dict) and len(prev_best) > 0:
+                try:
+                    if "num_leaves" in prev_best:
+                        lo, hi = _narrow(float(prev_best["num_leaves"]), nl_lo, nl_hi)
+                        nl_lo, nl_hi = int(max(nl_lo, lo)), int(min(nl_hi, hi))
+                    if "learning_rate" in prev_best:
+                        lr_lo, lr_hi = _narrow(float(prev_best["learning_rate"]), lr_lo, lr_hi)
+                    if "feature_fraction" in prev_best:
+                        ff_lo, ff_hi = _narrow(float(prev_best["feature_fraction"]), ff_lo, ff_hi)
+                    if "bagging_fraction" in prev_best:
+                        bf_lo, bf_hi = _narrow(float(prev_best["bagging_fraction"]), bf_lo, bf_hi)
+                    if "bagging_freq" in prev_best:
+                        lo, hi = _narrow(float(prev_best["bagging_freq"]), bfq_lo, bfq_hi, ratio=0.6)
+                        bfq_lo, bfq_hi = int(max(bfq_lo, lo)), int(min(bfq_hi, hi))
+                    if "min_data_in_leaf" in prev_best:
+                        lo, hi = _narrow(float(prev_best["min_data_in_leaf"]), mleaf_lo, mleaf_hi)
+                        mleaf_lo, mleaf_hi = int(max(mleaf_lo, lo)), int(min(mleaf_hi, hi))
+                    if "lambda_l1" in prev_best:
+                        l1_lo, l1_hi = _narrow(float(prev_best["lambda_l1"]), l1_lo, l1_hi)
+                    if "lambda_l2" in prev_best:
+                        l2_lo, l2_hi = _narrow(float(prev_best["lambda_l2"]), l2_lo, l2_hi)
+                    if "min_gain_to_split" in prev_best:
+                        mgt_lo, mgt_hi = _narrow(float(prev_best["min_gain_to_split"]), mgt_lo, mgt_hi)
+                    if "subsample" in prev_best:
+                        subs_lo, subs_hi = _narrow(float(prev_best["subsample"]), subs_lo, subs_hi)
+                except Exception:
+                    pass
+
             params = dict(
                 objective="multiclass",
                 num_class=5,
                 metric=["multi_logloss"],
                 boosting_type="gbdt",
-                num_leaves=trial.suggest_int("num_leaves", 64, 256),
-                learning_rate=trial.suggest_float("learning_rate", 0.01, 0.08, log=True),
-                feature_fraction=trial.suggest_float("feature_fraction", 0.6, 0.95),
-                bagging_fraction=trial.suggest_float("bagging_fraction", 0.6, 0.95),
-                bagging_freq=trial.suggest_int("bagging_freq", 1, 6),
-                min_data_in_leaf=trial.suggest_int("min_data_in_leaf", 50, 400),
+                num_leaves=trial.suggest_int("num_leaves", nl_lo, nl_hi),
+                learning_rate=trial.suggest_float("learning_rate", lr_lo, lr_hi, log=True),
+                feature_fraction=trial.suggest_float("feature_fraction", ff_lo, ff_hi),
+                bagging_fraction=trial.suggest_float("bagging_fraction", bf_lo, bf_hi),
+                bagging_freq=trial.suggest_int("bagging_freq", bfq_lo, bfq_hi),
+                min_data_in_leaf=trial.suggest_int("min_data_in_leaf", mleaf_lo, mleaf_hi),
                 max_depth=trial.suggest_categorical("max_depth", [-1, 8, 10, 12]),
-                lambda_l1=trial.suggest_float("lambda_l1", 1e-3, 10.0, log=True),
-                lambda_l2=trial.suggest_float("lambda_l2", 1e-3, 10.0, log=True),
-                min_gain_to_split=trial.suggest_float("min_gain_to_split", 1e-3, 5.0, log=True),
+                lambda_l1=trial.suggest_float("lambda_l1", l1_lo, l1_hi, log=True),
+                lambda_l2=trial.suggest_float("lambda_l2", l2_lo, l2_hi, log=True),
+                min_gain_to_split=trial.suggest_float("min_gain_to_split", mgt_lo, mgt_hi, log=True),
                 verbose=-1,
                 seed=trial.suggest_int("seed", 1, 10000),
                 class_weight=class_weight_list,
-                subsample=trial.suggest_float("subsample", 0.6, 0.95),
+                subsample=trial.suggest_float("subsample", subs_lo, subs_hi),
                 feature_pre_filter=False,
                 num_threads=_LGB_THREADS,
             )
@@ -455,6 +515,7 @@ def train_multilevel_model(
                 X_va, y_va = X_all.loc[idx_va], y_all.loc[idx_va].map(class_to_idx)
                 dtrain = lgb.Dataset(X_tr, label=y_tr)
                 dval = lgb.Dataset(X_va, label=y_va)
+                callbacks = [lgb.early_stopping(stopping_rounds=200, verbose=False)]
                 model = _lgb_train_with_gpu_fallback(
                     params,
                     dtrain,
@@ -462,7 +523,7 @@ def train_multilevel_model(
                     valid_sets=[dtrain, dval],
                     valid_names=["train", "valid"],
                     feval=make_pnl_feval(idx_tr, idx_va, labeled["next_ret"]),
-                    callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)],
+                    callbacks=callbacks,
                 )
                 # Evaluate mean pnl on this fold using the live eval function
                 next_ret_va_series = labeled["next_ret"].reindex(X_va.index)
@@ -470,9 +531,10 @@ def train_multilevel_model(
                 fold_scores.append(mean_pnl)
             return -float(np.mean(fold_scores))  # minimize
 
-        study = optuna.create_study(direction="minimize")
+        pruner = optuna.pruners.MedianPruner(n_startup_trials=max(10, trials // 10), n_warmup_steps=50) if hpo_pruning else None
+        study = optuna.create_study(direction="minimize", pruner=pruner)
         # Use parallel trials leveraging host CPU, while each LGBM uses limited threads
-        study.optimize(objective, n_trials=int(max(5, trials)), n_jobs=int(max(1, n_jobs)))
+        study.optimize(objective, n_trials=int(max(5, trials)), n_jobs=int(max(1, n_jobs)), gc_after_trial=True)
         best_params = study.best_trial.params
         # Ensure final params carry our thread setting
         best_params["num_threads"] = _LGB_THREADS
@@ -606,13 +668,43 @@ def train_multilevel_model(
         p_nonflat_bt = p_up_raw_bt + p_down_raw_bt
         with np.errstate(divide="ignore", invalid="ignore"):
             p_up_cond_bt = np.where(p_nonflat_bt > 1e-12, p_up_raw_bt / p_nonflat_bt, 0.5)
+            p_down_cond_bt = np.where(p_nonflat_bt > 1e-12, p_down_raw_bt / p_nonflat_bt, 0.5)
 
         p_up_bt_s = pd.Series(p_up_cond_bt, index=idx_bt)
+        p_down_bt_s = pd.Series(p_down_cond_bt, index=idx_bt)
         t = float(best_thr)
         rt_cost = cost.roundtrip_cost_ret
+        # Signal based solely on threshold band (no confidence filter applied to keep CSV complete)
         signal_bt = np.where(p_up_bt_s > t, 1, np.where(p_up_bt_s < 1 - t, -1, 0))
+
+        # Confidence analogous to live: margin beyond threshold on the chosen side
+        denom = max(1e-9, 1.0 - t)
+        conf_up = (p_up_bt_s.values - t) / denom
+        conf_down = (p_down_bt_s.values - t) / denom
+        conf_bt = np.zeros_like(conf_up)
+        conf_bt = np.where(signal_bt == 1, conf_up, conf_bt)
+        conf_bt = np.where(signal_bt == -1, conf_down, conf_bt)
+        conf_bt = np.clip(conf_bt, 0.0, 1.0)
+
+        # Flat explanation: distance to nearest boundary
+        lo_band = 1.0 - t
+        hi_band = t
+        margin = np.where((p_up_bt_s.values > lo_band) & (p_up_bt_s.values < hi_band),
+                          np.minimum(hi_band - p_up_bt_s.values, p_up_bt_s.values - lo_band),
+                          0.0)
+        flat_reason = np.where(signal_bt == 0, np.array([f"neutral, margin {m:.3f}" for m in margin]), "")
+
         pnl_bt = np.where(signal_bt == 1, next_ret_bt - rt_cost, np.where(signal_bt == -1, -next_ret_bt - rt_cost, 0.0))
-        df_bt = pd.DataFrame({"prob_up": p_up_bt_s, "signal": signal_bt, "next_ret": next_ret_bt, "pnl": pnl_bt}, index=idx_bt)
+        df_bt = pd.DataFrame({
+            "prob_up": p_up_bt_s,
+            "signal": signal_bt,
+            "confidence": conf_bt,
+            "decision_threshold": t,
+            "flat_reason": flat_reason,
+            "flat_margin": margin,
+            "next_ret": next_ret_bt,
+            "pnl": pnl_bt
+        }, index=idx_bt)
         os.makedirs("data/processed", exist_ok=True)
         df_bt.to_csv("data/processed/advanced_backtest.csv", index_label="timestamp")
 
