@@ -233,7 +233,7 @@ def predict_stream(symbol: str, model_path: str, meta_path: str, minutes_to_run:
         raw2 = fetch_recent_ohlcv(symbol, minutes=120)
 
         # Robust index alignment: use nearest minute within a small tolerance
-        def _nearest_label(idx: pd.DatetimeIndex, ts: pd.Timestamp, tol: str = "90s") -&gt; Optional[pd.Timestamp]:
+        def _nearest_label(idx: pd.DatetimeIndex, ts: pd.Timestamp, tol: str = "90s") -> Optional[pd.Timestamp]:
             if not isinstance(ts, pd.Timestamp):
                 ts = pd.Timestamp(ts)
             if ts.tzinfo is None:
@@ -256,11 +256,11 @@ def predict_stream(symbol: str, model_path: str, meta_path: str, minutes_to_run:
             next_ret = float(np.log(c1) - np.log(c0))
             tau = cost.roundtrip_cost_ret
             if signal == 1:
-                correct = next_ret &gt; tau
+                correct = next_ret > tau
             elif signal == -1:
-                correct = next_ret &lt; -tau
+                correct = next_ret < -tau
             else:
-                correct = abs(next_ret) &lt;= tau
+                correct = abs(next_ret) <= tau
 
             print(f"Eval {nxt_lbl}: next_ret={next_ret:.6e} correct={bool(correct)}")
             append_row(dict(
