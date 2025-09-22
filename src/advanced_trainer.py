@@ -333,8 +333,9 @@ def train_multilevel_model(
 
     # Custom PnL evaluation metric (higher is better) - uses fold's validation segment
     def make_pnl_feval(tr_idx: pd.Index, va_idx: pd.Index, next_ret_series: pd.Series):
-        next_ret_tr = next_ret_series.loc[tr_idx].values
-        next_ret_va = next_ret_series.loc[va_idx].values
+        # Robust alignment: reindex to avoid KeyError if any labels are missing due to prior dropna/feature pruning
+        next_ret_tr = next_ret_series.reindex(tr_idx).to_numpy()
+        next_ret_va = next_ret_series.reindex(va_idx).to_numpy()
         len_tr, len_va = len(next_ret_tr), len(next_ret_va)
 
         def pnl_feval(y_pred: np.ndarray, dset: "lgb.Dataset"):
@@ -419,7 +420,8 @@ def train_multilevel_model(
                     callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)],
                 )
                 # Evaluate mean pnl on this fold using the live eval function
-                thr, mean_pnl = _eval_model_pnl(model, X_va, labeled.loc[idx_va, "next_ret"], class_to_idx, cost, min_confidence=0.20)
+                next_ret_va_series = labeled["next_ret"].reindex(X_va.index)
+                thr, mean_pnl = _eval_model_pnl(model, X_va, next_ret_va_series, class_to_idx, cost, min_confidence=0.20)
                 fold_scores.append(mean_pnl)
             return -float(np.mean(fold_scores))  # minimize
 
@@ -452,7 +454,8 @@ def train_multilevel_model(
             feval=make_pnl_feval(idx_tr_final, idx_va_final, labeled["next_ret"]),
             callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)],
         )
-        best_thr, best_score = _eval_model_pnl(best_model, X_va, labeled.loc[idx_va_final, "next_ret"], class_to_idx, cost, min_confidence=0.20)
+        next_ret_va_series = labeled["next_ret"].reindex(X_va.index)
+        best_thr, best_score = _eval_model_pnl(best_model, X_va, next_ret_va_series, class_to_idx, cost, min_confidence=0.20)
     except Exception:
         # Fallback to previous small random search on the 85/15 split
         split = int(n_tv * 0.85)
@@ -461,8 +464,8 @@ def train_multilevel_model(
         idx_va = tv_idx_sorted[split:]
         X_tr, y_tr = X_all.loc[idx_tr], y_all.loc[idx_tr]
         X_va, y_va = X_all.loc[idx_va], y_all.loc[idx_va]
-        next_ret_tr = labeled.loc[idx_tr, "next_ret"].values
-        next_ret_va = labeled.loc[idx_va, "next_ret"].values
+        next_ret_tr = labeled["next_ret"].reindex(idx_tr).values
+        next_ret_va = labeled["next_ret"].reindex(idx_va).values
         y_tr_idx = y_tr.map(class_to_idx)
         y_va_idx = y_va.map(class_to_idx)
 
@@ -543,7 +546,7 @@ def train_multilevel_model(
         report("Backtesting (holdout)", 0.75)
         idx_bt = labeled.index[back_mask]
         X_bt = X_all.loc[idx_bt]
-        next_ret_bt = labeled.loc[idx_bt, "next_ret"]
+        next_ret_bt = labeled["next_ret"].reindex(idx_bt)
         proba_bt = best_model.predict(X_bt, num_iteration=getattr(best_model, "best_iteration", None))
 
         p_down2_bt = proba_bt[:, class_to_idx[-2]]
