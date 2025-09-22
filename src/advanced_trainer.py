@@ -9,6 +9,12 @@ import pandas as pd
 import ccxt
 import lightgbm as lgb
 
+# Optional system introspection
+try:
+    import psutil  # type: ignore
+except Exception:
+    psutil = None  # type: ignore
+
 from src.feature_lib import build_enriched_features  # enriched TA + macro + (optional) on-chain
 from src.run_pipeline import CostModel, tune_threshold_for_pnl
 
@@ -27,6 +33,20 @@ class AdvancedMeta:
 def ensure_dirs():
     for d in ["data", "data/raw", "data/processed"]:
         os.makedirs(d, exist_ok=True)
+
+
+def _host_caps() -> Tuple[int, float]:
+    """
+    Return (cpu_count, mem_gb). Falls back safely if psutil is unavailable.
+    """
+    cpu = os.cpu_count() or 1
+    mem_gb = 0.0
+    try:
+        if psutil is not None:
+            mem_gb = float(psutil.virtual_memory().total) / (1024 ** 3)
+    except Exception:
+        mem_gb = 0.0
+    return int(cpu), float(mem_gb)
 
 
 def _fetch_ohlcv_days(symbol: str, days: int) -> pd.DataFrame:
@@ -233,6 +253,7 @@ def train_multilevel_model(
     progress: Optional[Callable[[str, float], None]] = None,
     trials: int = 60,
     backtest_days: int = 0,
+    n_jobs: Optional[int] = None,
 ) -> Tuple[str, str]:
     """
     Train a multi-level (5-class) LightGBM model and save to data/processed/.
@@ -251,6 +272,14 @@ def train_multilevel_model(
     df.to_parquet(raw_path)
     report("Building features", 0.10)
     feats = build_enriched_features(df, symbol)
+
+    # Determine host capabilities and parallelization plan
+    cpu_count, mem_gb = _host_caps()
+    # Default: half the CPUs for parallel trials, at least 1, cap at 8 by default
+    if n_jobs is None or int(n_jobs) <= 0:
+        n_jobs = max(1, min(8, cpu_count // 2 if cpu_count >= 2 else 1))
+    # Each LightGBM training uses its own threads. Reserve threads per trial.
+    lgb_threads = max(1, cpu_count // int(max(1, n_jobs)))
 
     report("Labeling (multi-level)", 0.18)
     labeled = build_multi_level_labels(feats, cost)
@@ -372,6 +401,7 @@ def train_multilevel_model(
                 class_weight=class_weight_list,
                 subsample=trial.suggest_float("subsample", 0.6, 0.95),
                 feature_pre_filter=False,
+                num_threads=int(lgb_threads),
             )
             fold_scores = []
             for (idx_tr, idx_va) in folds:
@@ -394,8 +424,11 @@ def train_multilevel_model(
             return -float(np.mean(fold_scores))  # minimize
 
         study = optuna.create_study(direction="minimize")
-        study.optimize(objective, n_trials=int(max(5, trials)))
+        # Use parallel trials leveraging host CPU, while each LGBM uses limited threads
+        study.optimize(objective, n_trials=int(max(5, trials)), n_jobs=int(max(1, n_jobs)))
         best_params = study.best_trial.params
+        # Ensure final params carry our thread setting
+        best_params["num_threads"] = int(lgb_threads)
 
         # Train a final model on 85/15 split (kept for threshold tuning) using best params
         split = int(n_tv * 0.85)
@@ -408,6 +441,8 @@ def train_multilevel_model(
         dval = lgb.Dataset(X_va, label=y_va)
         params = dict(best_params)
         params.update(dict(objective="multiclass", num_class=5, metric=["multi_logloss"], verbose=-1, class_weight=class_weight_list))
+        # Ensure thread setting is present
+        params["num_threads"] = int(lgb_threads)
         best_model = lgb.train(
             params,
             dtrain,
@@ -474,10 +509,13 @@ def train_multilevel_model(
         rng = np.random.RandomState(42)
         best_mean_pnl = -1e9
         trials_ = int(max(1, trials))
-        for i in range(trials_):
-            params = _sample_params(rng, class_weight_list)
-            model = lgb.train(
-                params,
+
+        # Parallel random search using threads; cap LightGBM threads per trial
+        def run_one(_seed: int) -> Tuple[float, float, "lgb.Booster"]:
+            local_params = _sample_params(np.random.RandomState(_seed), class_weight_list)
+            local_params["num_threads"] = int(lgb_threads)
+            mdl = lgb.train(
+                local_params,
                 dtrain,
                 num_boost_round=4000,
                 valid_sets=[dtrain, dval],
@@ -485,13 +523,19 @@ def train_multilevel_model(
                 feval=pnl_feval,
                 callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)],
             )
-            thr, mean_pnl = _eval_model_pnl(model, X_va, next_ret_va, class_to_idx, cost, min_confidence=0.20)
-            if mean_pnl > best_mean_pnl:
-                best_mean_pnl = mean_pnl
-                best_model = model
-                best_thr = thr
-            if progress:
-                progress(f"Hyperparameter search ({i+1}/{trials_})", 0.22 + 0.5 * (i + 1) / trials_)
+            thr_, mean_pnl_ = _eval_model_pnl(mdl, X_va, next_ret_va, class_to_idx, cost, min_confidence=0.20)
+            return float(mean_pnl_), float(thr_), mdl
+
+        import concurrent.futures as _fut
+        seeds = list(rng.randint(1, 10_000, size=trials_))
+        with _fut.ThreadPoolExecutor(max_workers=int(max(1, n_jobs))) as pool:
+            for j, (mean_pnl, thr, mdl) in enumerate(pool.map(run_one, seeds), start=1):
+                if mean_pnl > best_mean_pnl:
+                    best_mean_pnl = mean_pnl
+                    best_model = mdl
+                    best_thr = thr
+                if progress:
+                    progress(f"Hyperparameter search (parallel {j}/{trials_})", 0.22 + 0.5 * (j) / trials_)
 
     # Optional small backtest on held-out last `backtest_days`
     backtest_metrics: Dict[str, float] = {}
@@ -557,6 +601,10 @@ def train_multilevel_model(
         meta["val_mean_pnl"] = float(best_score)
     except Exception:
         pass
+    # Record host parallelization settings
+    meta["cpu_count"] = int(cpu_count)
+    meta["n_jobs"] = int(max(1, n_jobs if n_jobs is not None else 1))
+    meta["lgb_threads_per_trial"] = int(lgb_threads)
     if back_mask.any():
         meta["backtest_days"] = int(backtest_days)
         meta["backtest_metrics"] = backtest_metrics

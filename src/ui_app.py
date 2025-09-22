@@ -310,10 +310,17 @@ with tabs[1]:
             def on_prog(stage: str, p: float):
                 adv_status.text(f"{stage} ... ({int(p*100)}%)")
                 adv_progress.progress(min(max(p, 0.0), 1.0))
+            # Determine default parallel jobs based on host CPU
+            try:
+                import os as _os
+                _cpu = _os.cpu_count() or 1
+                _jobs = max(1, min(8, _cpu // 2 if _cpu >= 2 else 1))
+            except Exception:
+                _jobs = 2
             if use_ensemble:
                 model_path, meta_path = train_ensemble_stacked(adv_symbol, int(adv_days), cost, progress=on_prog)
             else:
-                model_path, meta_path = train_multilevel_model(adv_symbol, int(adv_days), cost, progress=on_prog)
+                model_path, meta_path = train_multilevel_model(adv_symbol, int(adv_days), cost, progress=on_prog, n_jobs=_jobs)
             adv_progress.progress(1.0)
             adv_status.success(f"Advanced model trained.\nModel: {model_path}\nMeta: {meta_path}")
         except Exception as e:

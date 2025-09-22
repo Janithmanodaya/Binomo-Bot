@@ -80,6 +80,14 @@ class LiveApp(tk.Tk):
 
         # Advanced training controls
         self.adv_trials_var = tk.IntVar(value=60)
+        # Parallel jobs for HPO/training (default: half of CPUs capped at 8)
+        try:
+            import os as _os
+            _cpu = _os.cpu_count() or 1
+            _default_jobs = max(1, min(8, _cpu // 2 if _cpu >= 2 else 1))
+        except Exception:
+            _default_jobs = 2
+        self.adv_jobs_var = tk.IntVar(value=_default_jobs)
         self.adv_backtest_days_var = tk.IntVar(value=7)
         # Advanced live overrides
         self.adv_threshold_var = tk.DoubleVar(value=0.00)  # 0 -> use meta threshold
@@ -106,8 +114,11 @@ class LiveApp(tk.Tk):
         spin_bt_days = ttk.Spinbox(cfg, from_=0, to=60, increment=1, textvariable=self.adv_backtest_days_var)
         add_row(cfg, 9, "Backtest holdout days:", spin_bt_days)
 
+        spin_jobs = ttk.Spinbox(cfg, from_=1, to=32, increment=1, textvariable=self.adv_jobs_var)
+        add_row(cfg, 10, "Advanced parallel jobs:", spin_jobs)
+
         spin_thr = ttk.Spinbox(cfg, from_=0.00, to=0.90, increment=0.01, textvariable=self.adv_threshold_var)
-        add_row(cfg, 10, "Advanced live threshold (0=auto):", spin_thr)
+        add_row(cfg, 11, "Advanced live threshold (0=auto):", spin_thr)
 
         # Controls
         btns = ttk.Frame(frm)
@@ -572,6 +583,7 @@ class LiveApp(tk.Tk):
                         progress=on_prog,
                         trials=int(self.adv_trials_var.get()),
                         backtest_days=int(self.adv_backtest_days_var.get()),
+                        n_jobs=int(self.adv_jobs_var.get()),
                     )
                 except Exception as e:
                     self._append_live_log(f"Advanced training error: {e}\n")
