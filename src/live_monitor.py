@@ -94,15 +94,32 @@ def live_loop(
 
         # Fetch again to include the next bar
         raw2 = fetch_recent_ohlcv(symbol, minutes=500)
-        if current_ts not in raw2.index or next_bar_ts not in raw2.index:
+
+        # Robustly align timestamps to nearest index label within tolerance
+        def _nearest_label(idx: pd.DatetimeIndex, ts: pd.Timestamp, tol: str = "90s"):
+            if not isinstance(ts, pd.Timestamp):
+                ts = pd.Timestamp(ts)
+            if ts.tzinfo is None or ts.tz is None:
+                ts = ts.tz_localize("UTC")
+            else:
+                ts = ts.tz_convert("UTC")
+            pos = idx.get_indexer([ts], method="nearest", tolerance=pd.Timedelta(tol))
+            if pos.size and pos[0] != -1:
+                return idx[pos[0]]
+            return None
+
+        cur_lbl = _nearest_label(raw2.index, current_ts)
+        nxt_lbl = _nearest_label(raw2.index, next_bar_ts)
+
+        if cur_lbl is None or nxt_lbl is None:
             # If exchange lag, skip evaluation but continue
             if on_update:
                 on_update({"msg": "Next bar not available yet; skipping evaluation."})
             continue
 
-        # Compute realized next_ret
-        c0 = raw2.loc[current_ts, "close"]
-        c1 = raw2.loc[next_bar_ts, "close"]
+        # Compute realized next_ret using aligned labels
+        c0 = raw2.loc[cur_lbl, "close"]
+        c1 = raw2.loc[nxt_lbl, "close"]
         next_ret = float(np.log(c1) - np.log(c0))
 
         # Determine correctness: UP correct if signal=1 and next_ret > tau; DOWN correct if signal=-1 and next_ret < -tau; FLAT correct if within [-tau, +tau]
