@@ -77,7 +77,8 @@ def load_macro_features(index: pd.DatetimeIndex) -> pd.DataFrame:
     daily = pd.concat(frames, axis=1).dropna(how="all")
     # As-of join to minute index: forward-fill
     macro = daily.reindex(index.union(daily.index)).sort_index().ffill().reindex(index)
-    macro = macro.replace([np.inf, -np.inf], np.nan).fillna(method="ffill")
+    # Use .ffill() instead of deprecated fillna(method="ffill")
+    macro = macro.replace([np.inf, -np.inf], np.nan).ffill()
     return macro
 
 
@@ -144,7 +145,8 @@ def load_onchain_features(symbol: str, index: pd.DatetimeIndex) -> pd.DataFrame:
 
     daily = pd.concat(frames, axis=1).dropna(how="all")
     oc = daily.reindex(index.union(daily.index)).sort_index().ffill().reindex(index)
-    oc = oc.replace([np.inf, -np.inf], np.nan).fillna(method="ffill")
+    # Use .ffill() instead of deprecated fillna(method="ffill")
+    oc = oc.replace([np.inf, -np.inf], np.nan).ffill()
     return oc
 
 

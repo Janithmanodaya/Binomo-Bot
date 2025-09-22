@@ -190,7 +190,8 @@ def _eval_model_pnl(
     p_down_cond_s = pd.Series(p_down_cond, index=X_va.index)
     rt_cost = cost.roundtrip_cost_ret
 
-    thresholds = np.linspace(0.58, 0.82, 25)
+    # Broaden threshold sweep slightly
+    thresholds = np.linspace(0.55, 0.85, 31)
     best_t = 0.65
     best_mean = -1e-9  # avoid selecting empty/flat by mistake
 
@@ -230,7 +231,7 @@ def train_multilevel_model(
     days: int,
     cost: CostModel,
     progress: Optional[Callable[[str, float], None]] = None,
-    trials: int = 20,
+    trials: int = 60,
     backtest_days: int = 0,
 ) -> Tuple[str, str]:
     """
@@ -547,6 +548,15 @@ def train_multilevel_model(
         classes=classes,
     ).__dict__
     meta["trials"] = int(trials)
+    # Persist best HPO params and validation score if available
+    try:
+        meta["best_params"] = dict(best_params) if best_params is not None else None
+    except Exception:
+        meta["best_params"] = None
+    try:
+        meta["val_mean_pnl"] = float(best_score)
+    except Exception:
+        pass
     if back_mask.any():
         meta["backtest_days"] = int(backtest_days)
         meta["backtest_metrics"] = backtest_metrics

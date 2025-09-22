@@ -79,7 +79,7 @@ class LiveApp(tk.Tk):
         self.live_default_thresh = tk.DoubleVar(value=0.55)
 
         # Advanced training controls
-        self.adv_trials_var = tk.IntVar(value=20)
+        self.adv_trials_var = tk.IntVar(value=60)
         self.adv_backtest_days_var = tk.IntVar(value=7)
         # Advanced live overrides
         self.adv_threshold_var = tk.DoubleVar(value=0.00)  # 0 -> use meta threshold

@@ -163,7 +163,8 @@ def build_rich_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out = _add_minute_level_features(out)
     # Multi-timeframe joins: 3m, 5m, 15m
-    out = _add_multi_timeframe_features(df, out, tfs=["3T", "5T", "15T"])
+    # Use 'min' instead of deprecated 'T' alias
+    out = _add_multi_timeframe_features(df, out, tfs=["3min", "5min", "15min"])
 
     out = out.replace([np.inf, -np.inf], np.nan).dropna().copy()
     return out
