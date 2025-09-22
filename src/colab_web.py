@@ -14,6 +14,22 @@ def _install_if_missing(pkg: str):
         print(f"+ Installing missing dependency: {pkg}")
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
 
+def _parse_port_from_argv(default_port: int = 8501) -> int:
+    # Accept `--port 9000` or `--port=9000` on argv
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a == "--port" and i + 1 < len(args):
+            try:
+                return int(args[i + 1])
+            except Exception:
+                pass
+        if a.startswith("--port="):
+            try:
+                return int(a.split("=", 1)[1])
+            except Exception:
+                pass
+    return default_port
+
 def main():
     # Ensure pyngrok is available
     _install_if_missing("pyngrok")
@@ -22,6 +38,7 @@ def main():
 
     # Configure auth token if provided
     token = os.environ.get("NGROK_AUTH_TOKEN") or os.environ.get("NGROK_TOKEN")
+    region = os.environ.get("NGROK_REGION")  # optional: us, eu, ap, au, sa, jp, in
     if token:
         try:
             ngrok.set_auth_token(token)
@@ -30,17 +47,21 @@ def main():
             print(f"! Failed to set ngrok token: {e}")
 
     # Determine port and UI script
-    port = int(os.environ.get("UI_PORT", "8501"))
+    port_env = int(os.environ.get("UI_PORT", "0") or "0")
+    port = port_env if port_env > 0 else _parse_port_from_argv(default_port=8501)
     ui_script = os.path.join("src", "ui_app.py")
     if not os.path.exists(ui_script):
         print(f"{ui_script} not found.")
         raise SystemExit(1)
 
-    # Launch Streamlit
+    # Launch Streamlit with Colab-friendly flags
     streamlit_cmd = [
         sys.executable, "-m", "streamlit", "run", ui_script,
         "--server.port", str(port),
         "--server.headless", "true",
+        "--server.address", "0.0.0.0",
+        "--server.enableCORS", "false",
+        "--server.enableXsrfProtection", "false",
         "--browser.gatherUsageStats", "false",
     ]
     print("+ Starting Streamlit UI...")
@@ -51,7 +72,10 @@ def main():
     print(f"+ Opening ngrok tunnel on port {port} ...")
     public_url = None
     try:
-        http_tunnel = ngrok.connect(port, "http")
+        if region:
+            http_tunnel = ngrok.connect(addr=port, proto="http", region=region)
+        else:
+            http_tunnel = ngrok.connect(port, "http")
         public_url = http_tunnel.public_url
         print("\n================= PUBLIC URL =================")
         print(public_url)

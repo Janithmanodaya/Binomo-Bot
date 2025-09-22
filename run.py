@@ -10,6 +10,19 @@ def run(cmd, check=True):
         raise SystemExit(result.returncode)
 
 
+def _get_arg_value(name: str) -> str | None:
+    """
+    Fetch value for flags like --port 9000 or --port=9000 from sys.argv.
+    """
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a == name and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
 def main():
     # 1) Install requirements using the current interpreter
     req_file = "requirements.txt"
@@ -35,9 +48,9 @@ def main():
         if not os.path.exists(ui_script):
             print(f"{ui_script} not found.")
             raise SystemExit(1)
-        # Allow overriding port via env var UI_PORT
-        port = os.environ.get("UI_PORT", "8501")
-        run(f'"{sys.executable}" -m streamlit run "{ui_script}" --server.port {port}')
+        # Allow overriding port via env var UI_PORT or via --port flag
+        port = _get_arg_value("--port") or os.environ.get("UI_PORT", "8501")
+        run(f'"{sys.executable}" -m streamlit run "{ui_script}" --server.address 0.0.0.0 --server.headless true --server.enableCORS false --server.enableXsrfProtection false --server.port {port}')
         return
 
     # Colab-friendly web launcher (Streamlit + ngrok)
@@ -46,7 +59,12 @@ def main():
         if not os.path.exists(colab_script):
             print(f"{colab_script} not found.")
             raise SystemExit(1)
-        run(f'"{sys.executable}" "{colab_script}"')
+        # Forward --port if provided
+        port = _get_arg_value("--port")
+        if port:
+            run(f'"{sys.executable}" "{colab_script}" --port {port}')
+        else:
+            run(f'"{sys.executable}" "{colab_script}"')
         return
 
     # Otherwise forward all args to the pipeline
