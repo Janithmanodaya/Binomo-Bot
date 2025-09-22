@@ -275,11 +275,12 @@ def train_multilevel_model(
 
     # Determine host capabilities and parallelization plan
     cpu_count, mem_gb = _host_caps()
-    # Default: half the CPUs for parallel trials, at least 1, cap at 8 by default
+    # More aggressive default parallelism: use most of the CPUs, cap at 16 by default
     if n_jobs is None or int(n_jobs) <= 0:
-        n_jobs = max(1, min(8, cpu_count // 2 if cpu_count >= 2 else 1))
-    # Each LightGBM training uses its own threads. Reserve threads per trial.
-    lgb_threads = max(1, cpu_count // int(max(1, n_jobs)))
+        n_jobs = max(1, min(16, cpu_count - 1 if cpu_count >= 3 else cpu_count))
+    # Each LightGBM training uses its own threads. Reserve threads per trial to avoid oversubscription.
+    lgb_threads = max(2, cpu_count // int(max(1, n_jobs)))
+    _LGB_THREADS = int(lgb_threads)
 
     report("Labeling (multi-level)", 0.18)
     labeled = build_multi_level_labels(feats, cost)
@@ -333,8 +334,9 @@ def train_multilevel_model(
 
     # Custom PnL evaluation metric (higher is better) - uses fold's validation segment
     def make_pnl_feval(tr_idx: pd.Index, va_idx: pd.Index, next_ret_series: pd.Series):
-        next_ret_tr = next_ret_series.loc[tr_idx].values
-        next_ret_va = next_ret_series.loc[va_idx].values
+        # Robust alignment: reindex to avoid KeyError if any labels are missing due to prior dropna/feature pruning
+        next_ret_tr = next_ret_series.reindex(tr_idx).to_numpy()
+        next_ret_va = next_ret_series.reindex(va_idx).to_numpy()
         len_tr, len_va = len(next_ret_tr), len(next_ret_va)
 
         def pnl_feval(y_pred: np.ndarray, dset: "lgb.Dataset"):
@@ -401,7 +403,7 @@ def train_multilevel_model(
                 class_weight=class_weight_list,
                 subsample=trial.suggest_float("subsample", 0.6, 0.95),
                 feature_pre_filter=False,
-                num_threads=int(lgb_threads),
+                num_threads=_LGB_THREADS,
             )
             fold_scores = []
             for (idx_tr, idx_va) in folds:
@@ -419,7 +421,8 @@ def train_multilevel_model(
                     callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)],
                 )
                 # Evaluate mean pnl on this fold using the live eval function
-                thr, mean_pnl = _eval_model_pnl(model, X_va, labeled.loc[idx_va, "next_ret"], class_to_idx, cost, min_confidence=0.20)
+                next_ret_va_series = labeled["next_ret"].reindex(X_va.index)
+                thr, mean_pnl = _eval_model_pnl(model, X_va, next_ret_va_series, class_to_idx, cost, min_confidence=0.20)
                 fold_scores.append(mean_pnl)
             return -float(np.mean(fold_scores))  # minimize
 
@@ -428,7 +431,9 @@ def train_multilevel_model(
         study.optimize(objective, n_trials=int(max(5, trials)), n_jobs=int(max(1, n_jobs)))
         best_params = study.best_trial.params
         # Ensure final params carry our thread setting
-        best_params["num_threads"] = int(lgb_threads)
+        best_params["num_threads"] = _LGB_THREADS
+        # Report chosen parallelism
+        report(f"Optuna parallel trials: {int(max(1, n_jobs))}, LGBM threads/trial: {_LGB_THREADS}", 0.72)
 
         # Train a final model on 85/15 split (kept for threshold tuning) using best params
         split = int(n_tv * 0.85)
@@ -442,7 +447,7 @@ def train_multilevel_model(
         params = dict(best_params)
         params.update(dict(objective="multiclass", num_class=5, metric=["multi_logloss"], verbose=-1, class_weight=class_weight_list))
         # Ensure thread setting is present
-        params["num_threads"] = int(lgb_threads)
+        params["num_threads"] = _LGB_THREADS
         best_model = lgb.train(
             params,
             dtrain,
@@ -452,7 +457,8 @@ def train_multilevel_model(
             feval=make_pnl_feval(idx_tr_final, idx_va_final, labeled["next_ret"]),
             callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)],
         )
-        best_thr, best_score = _eval_model_pnl(best_model, X_va, labeled.loc[idx_va_final, "next_ret"], class_to_idx, cost, min_confidence=0.20)
+        next_ret_va_series = labeled["next_ret"].reindex(X_va.index)
+        best_thr, best_score = _eval_model_pnl(best_model, X_va, next_ret_va_series, class_to_idx, cost, min_confidence=0.20)
     except Exception:
         # Fallback to previous small random search on the 85/15 split
         split = int(n_tv * 0.85)
@@ -461,8 +467,8 @@ def train_multilevel_model(
         idx_va = tv_idx_sorted[split:]
         X_tr, y_tr = X_all.loc[idx_tr], y_all.loc[idx_tr]
         X_va, y_va = X_all.loc[idx_va], y_all.loc[idx_va]
-        next_ret_tr = labeled.loc[idx_tr, "next_ret"].values
-        next_ret_va = labeled.loc[idx_va, "next_ret"].values
+        next_ret_tr = labeled["next_ret"].reindex(idx_tr).values
+        next_ret_va = labeled["next_ret"].reindex(idx_va).values
         y_tr_idx = y_tr.map(class_to_idx)
         y_va_idx = y_va.map(class_to_idx)
 
@@ -513,7 +519,7 @@ def train_multilevel_model(
         # Parallel random search using threads; cap LightGBM threads per trial
         def run_one(_seed: int) -> Tuple[float, float, "lgb.Booster"]:
             local_params = _sample_params(np.random.RandomState(_seed), class_weight_list)
-            local_params["num_threads"] = int(lgb_threads)
+            local_params["num_threads"] = _LGB_THREADS
             mdl = lgb.train(
                 local_params,
                 dtrain,
@@ -543,7 +549,7 @@ def train_multilevel_model(
         report("Backtesting (holdout)", 0.75)
         idx_bt = labeled.index[back_mask]
         X_bt = X_all.loc[idx_bt]
-        next_ret_bt = labeled.loc[idx_bt, "next_ret"]
+        next_ret_bt = labeled["next_ret"].reindex(idx_bt)
         proba_bt = best_model.predict(X_bt, num_iteration=getattr(best_model, "best_iteration", None))
 
         p_down2_bt = proba_bt[:, class_to_idx[-2]]
@@ -604,9 +610,9 @@ def train_multilevel_model(
     # Record host parallelization settings
     meta["cpu_count"] = int(cpu_count)
     meta["n_jobs"] = int(max(1, n_jobs if n_jobs is not None else 1))
-    meta["lgb_threads_per_trial"] = int(lgb_threads)
+    meta["lgb_threads_per_trial"] = int(_LGB_THREADS)
     if back_mask.any():
-        meta["backtest_days"] = int(backtest_days)
+        meta["backest_days"] = int(backtest_days)
         meta["backtest_metrics"] = backtest_metrics
 
     with open(meta_path, "w", encoding="utf-8") as f:

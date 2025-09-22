@@ -146,6 +146,7 @@ class LiveApp(tk.Tk):
         self.load_adv_btn.pack(side=tk.LEFT, padx=(8, 0))
         self.dl_hist_btn = ttk.Button(adv_btns, text="Download History", command=self.download_history_now)
         self.dl_hist_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self._dl_thread: Optional[threading.Thread] = None
 
         # Training progress
         progf = ttk.LabelFrame(frm, text="Training progress", padding=10)
@@ -382,6 +383,7 @@ class LiveApp(tk.Tk):
                 progress=on_prog,
                 trials=int(self.adv_trials_var.get()),
                 backtest_days=int(self.adv_backtest_days_var.get()),
+                n_jobs=int(self.adv_jobs_var.get()),
             )
             self._adv_bundle = load_advanced_bundle()
             if self._adv_bundle is None:
@@ -484,40 +486,63 @@ class LiveApp(tk.Tk):
             messagebox.showerror("Load Model", str(e))
 
     def download_history_now(self):
-        try:
-            symbol = self.symbol_var.get()
-            days = int(self.live_train_days.get())
-            self.live_status.set(f"Downloading {days} days for {symbol} ...")
-            self._append_live_log(f"Downloading history: {symbol}, {days} days\n")
-            import ccxt
-            ex = ccxt.binance({"enableRateLimit": True})
-            timeframe = "1m"
-            limit = 1000
-            since = int((pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)).timestamp() * 1000)
-            rows: List[List[float]] = []
-            while True:
-                ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
-                if not ohlcv:
-                    break
-                rows.extend(ohlcv)
-                since = ohlcv[-1][0] + 60_000
-                time.sleep(ex.rateLimit / 1000.0)
-                if len(ohlcv) < limit:
-                    break
-            if not rows:
-                raise RuntimeError("No OHLCV data fetched.")
-            df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-            df = df.set_index("timestamp").sort_index().drop_duplicates()
-            os.makedirs("data/raw", exist_ok=True)
-            suffix = f"{symbol.replace('/', '')}_{days}d_1m.parquet"
-            out_path = os.path.join("data", "raw", suffix)
-            df.to_parquet(out_path)
-            self._append_live_log(f"Saved history to: {out_path} ({len(df):,} rows)\n")
-            self.live_status.set("Download complete")
-        except Exception as e:
-            messagebox.showerror("Download History", str(e))
-            self.live_status.set("Download error")
+        # Prevent concurrent downloads
+        if self._dl_thread and self._dl_thread.is_alive():
+            messagebox.showinfo("Download History", "A download is already in progress.")
+            return
+
+        # Disable button during download
+        self.dl_hist_btn.configure(state=tk.DISABLED)
+
+        symbol = self.symbol_var.get()
+        days = int(self.live_train_days.get())
+        self.live_status.set(f"Downloading {days} days for {symbol} ...")
+        self._append_live_log(f"Downloading history: {symbol}, {days} days\n")
+
+        def _worker():
+            try:
+                import ccxt
+                ex = ccxt.binance({"enableRateLimit": True})
+                timeframe = "1m"
+                limit = 1000
+                since = int((pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)).timestamp() * 1000)
+                rows: List[List[float]] = []
+                while True:
+                    ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
+                    if not ohlcv:
+                        break
+                    rows.extend(ohlcv)
+                    since = ohlcv[-1][0] + 60_000
+                    time.sleep(ex.rateLimit / 1000.0)
+                    if len(ohlcv) < limit:
+                        break
+                if not rows:
+                    raise RuntimeError("No OHLCV data fetched.")
+
+                df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+                df = df.set_index("timestamp").sort_index().drop_duplicates()
+                os.makedirs("data/raw", exist_ok=True)
+                suffix = f"{symbol.replace('/', '')}_{days}d_1m.parquet"
+                out_path = os.path.join("data", "raw", suffix)
+                df.to_parquet(out_path)
+
+                # UI updates on main thread
+                def _on_success():
+                    self._append_live_log(f"Saved history to: {out_path} ({len(df):,} rows)\n")
+                    self.live_status.set("Download complete")
+                    self.dl_hist_btn.configure(state=tk.NORMAL)
+                self.after(0, _on_success)
+
+            except Exception as e:
+                def _on_error():
+                    messagebox.showerror("Download History", str(e))
+                    self.live_status.set("Download error")
+                    self.dl_hist_btn.configure(state=tk.NORMAL)
+                self.after(0, _on_error)
+
+        self._dl_thread = threading.Thread(target=_worker, daemon=True)
+        self._dl_thread.start()
 
     # ---------------- Live actions ----------------
     def _on_live_update(self, msg: Dict[str, object]):

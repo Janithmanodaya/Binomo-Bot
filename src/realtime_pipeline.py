@@ -231,11 +231,28 @@ def predict_stream(symbol: str, model_path: str, meta_path: str, minutes_to_run:
         time.sleep(sleep_s)
 
         raw2 = fetch_recent_ohlcv(symbol, minutes=120)
-        if current_ts not in raw2.index or next_ts not in raw2.index:
+
+        # Robust index alignment: use nearest minute within a small tolerance
+        def _nearest_label(idx: pd.DatetimeIndex, ts: pd.Timestamp, tol: str = "90s") -> Optional[pd.Timestamp]:
+            if not isinstance(ts, pd.Timestamp):
+                ts = pd.Timestamp(ts)
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            else:
+                ts = ts.tz_convert("UTC")
+            pos = idx.get_indexer([ts], method="nearest", tolerance=pd.Timedelta(tol))
+            if pos.size and pos[0] != -1:
+                return idx[pos[0]]
+            return None
+
+        cur_lbl = _nearest_label(raw2.index, current_ts)
+        nxt_lbl = _nearest_label(raw2.index, next_ts)
+
+        if cur_lbl is None or nxt_lbl is None:
             print("Next bar not available yet; skipping evaluation.")
         else:
-            c0 = float(raw2.loc[current_ts, "close"])
-            c1 = float(raw2.loc[next_ts, "close"])
+            c0 = float(raw2.loc[cur_lbl, "close"])
+            c1 = float(raw2.loc[nxt_lbl, "close"])
             next_ret = float(np.log(c1) - np.log(c0))
             tau = cost.roundtrip_cost_ret
             if signal == 1:
@@ -245,9 +262,9 @@ def predict_stream(symbol: str, model_path: str, meta_path: str, minutes_to_run:
             else:
                 correct = abs(next_ret) <= tau
 
-            print(f"Eval {next_ts}: next_ret={next_ret:.6e} correct={bool(correct)}")
+            print(f"Eval {nxt_lbl}: next_ret={next_ret:.6e} correct={bool(correct)}")
             append_row(dict(
-                timestamp=next_ts.isoformat(),
+                timestamp=nxt_lbl.isoformat(),
                 prob_up=prob_up,
                 confidence=confidence,
                 signal=signal,
