@@ -77,7 +77,8 @@ def load_macro_features(index: pd.DatetimeIndex) -> pd.DataFrame:
     daily = pd.concat(frames, axis=1).dropna(how="all")
     # As-of join to minute index: forward-fill
     macro = daily.reindex(index.union(daily.index)).sort_index().ffill().reindex(index)
-    macro = macro.replace([np.inf, -np.inf], np.nan).fillna(method="ffill")
+    # Use .ffill() instead of deprecated fillna(method="ffill")
+    macro = macro.replace([np.inf, -np.inf], np.nan).ffill()
     return macro
 
 
@@ -144,13 +145,52 @@ def load_onchain_features(symbol: str, index: pd.DatetimeIndex) -> pd.DataFrame:
 
     daily = pd.concat(frames, axis=1).dropna(how="all")
     oc = daily.reindex(index.union(daily.index)).sort_index().ffill().reindex(index)
-    oc = oc.replace([np.inf, -np.inf], np.nan).fillna(method="ffill")
+    # Use .ffill() instead of deprecated fillna(method="ffill")
+    oc = oc.replace([np.inf, -np.inf], np.nan).ffill()
     return oc
+
+
+def _load_sentiment_from_csv(index: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Optionally load a CSV with columns [timestamp, score] from env SENTIMENT_CSV and align it.
+    The resulting column is named 'sentiment_manual' and forward-filled to minute index.
+    """
+    path = os.getenv("SENTIMENT_CSV", "").strip()
+    if not path or not os.path.exists(path) or len(index) == 0:
+        return pd.DataFrame(index=index)
+    try:
+        df = pd.read_csv(path)
+        # Try several timestamp field names
+        ts_col = None
+        for c in ["timestamp", "time", "date", "datetime"]:
+            if c in df.columns:
+                ts_col = c
+                break
+        if ts_col is None:
+            return pd.DataFrame(index=index)
+        df[ts_col] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+        df = df.dropna(subset=[ts_col]).sort_values(ts_col)
+        # choose score column
+        score_col = None
+        for c in ["score", "sentiment", "value"]:
+            if c in df.columns:
+                score_col = c
+                break
+        if score_col is None:
+            return pd.DataFrame(index=index)
+        s = df.set_index(ts_col)[score_col].astype(float)
+        # sanitize and align
+        s = s.replace([np.inf, -np.inf], np.nan).ffill()
+        sent = s.reindex(index.union(s.index)).sort_index().ffill().reindex(index)
+        return pd.DataFrame({"sentiment_manual": sent}, index=index)
+    except Exception:
+        return pd.DataFrame(index=index)
 
 
 def build_enriched_features(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     """
-    Build OHLCV technical features and enrich with macro and optional on-chain series.
+    Build OHLCV technical features and enrich with macro, optional on-chain series,
+    and optional sentiment (from CSV if provided via SENTIMENT_CSV env).
     """
     # Local import to avoid circular
     from src.features_ta import build_rich_features
@@ -161,12 +201,15 @@ def build_enriched_features(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
 
     macro = load_macro_features(base.index)
     onchain = load_onchain_features(symbol, base.index)
+    sent = _load_sentiment_from_csv(base.index)
 
     frames = [base]
     if not macro.empty:
         frames.append(macro)
     if not onchain.empty:
         frames.append(onchain)
+    if not sent.empty:
+        frames.append(sent)
 
     out = pd.concat(frames, axis=1)
     out = out.replace([np.inf, -np.inf], np.nan).dropna()
