@@ -444,6 +444,7 @@ def predict_latest(
     symbol: str,
     feature_minutes: int,
     bundle: Dict,
+    threshold_override: Optional[float] = None,
 ) -> Tuple[pd.Timestamp, float, int, float]:
     """
     Predict on the latest completed minute using the advanced model.
@@ -452,7 +453,13 @@ def predict_latest(
     booster: lgb.Booster = bundle["booster"]
     meta = bundle["meta"]
     feature_names: List[str] = meta["feature_names"]
-    threshold: float = float(meta["threshold"])
+    # Use override threshold if provided, otherwise fall back to meta
+    thr: float = float(meta["threshold"])
+    if threshold_override is not None:
+        try:
+            thr = float(threshold_override)
+        except Exception:
+            pass
 
     # Get a recent window straight from the exchange for freshness
     ex = ccxt.binance({"enableRateLimit": True})
@@ -473,5 +480,5 @@ def predict_latest(
     X_row = X_row[feature_names]
 
     prob_vec = booster.predict(X_row)[0]  # length 5
-    prob_up, signal, confidence = _confidence_from_probs(np.array(prob_vec, dtype=float), threshold)
+    prob_up, signal, confidence = _confidence_from_probs(np.array(prob_vec, dtype=float), thr)
     return ts, float(prob_up), int(signal), float(confidence)
